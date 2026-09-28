@@ -1,0 +1,118 @@
+{
+  "mode": "warn",
+  "routes": [
+    {
+      "match": [
+        "专利",
+        "规格书",
+        "patent",
+        "docx",
+        "pptx",
+        "xlsx",
+        "pdf",
+        "论文",
+        "文献",
+        "disclosure"
+      ],
+      "agent": "IPP"
+    },
+    {
+      "match": [
+        "代码",
+        "code",
+        "python",
+        "脚本",
+        "script",
+        "重构",
+        "refactor",
+        "debug",
+        "CI",
+        "devops"
+      ],
+      "agent": "Codex_Agent"
+    },
+    {
+      "match": [
+        "pcb",
+        "原理图",
+        "schematic",
+        "kicad",
+        "altium",
+        "erc",
+        "drc",
+        "固件",
+        "firmware",
+        "renode",
+        "plc",
+        "dxf",
+        "gcode",
+        "sdf",
+        "srdf",
+        "step",
+        "cad",
+        "3d"
+      ],
+      "agent": "PCB_Agent"
+    },
+    {
+      "match": [
+        "图",
+        "chart",
+        "diagram",
+        "架构",
+        "image",
+        "图像",
+        "视频",
+        "video",
+        "ppt",
+        "海报",
+        "poster",
+        "infographic",
+        "svg",
+        "画"
+      ],
+      "agent": "Designer"
+    },
+    {
+      "match": [
+        "mis",
+        "chid",
+        "mtcode",
+        "wu tracking",
+        "vlab",
+        "kbsearch",
+        "lcfc 内部"
+      ],
+      "agent": "SE"
+    },
+    {
+      "match": [
+        "打车",
+        "地图",
+        "网盘",
+        "咖啡",
+        "音乐",
+        "点单",
+        "外卖",
+        "社媒"
+      ],
+      "agent": "PersonalHelper"
+    }
+  ],
+  "ext_routes": {
+    ".docx": "IPP",
+    ".pptx": "IPP",
+    ".xlsx": "IPP",
+    ".pdf": "IPP",
+    ".py": "Codex_Agent",
+    ".svg": "Designer",
+    ".png": "Designer",
+    ".mp4": "Designer",
+    ".dxf": "PCB_Agent",
+    ".gcode": "PCB_Agent",
+    ".sdf": "PCB_Agent",
+    ".srdf": "PCB_Agent",
+    ".step": "PCB_Agent",
+    ".kicad_pcb": "PCB_Agent"
+  }
+}
