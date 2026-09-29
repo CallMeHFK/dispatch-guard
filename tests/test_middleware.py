@@ -9,6 +9,7 @@ shipped ``routes.example.json``, so no test ever needs a real dispatch table.
 """
 import asyncio
 import json
+import logging
 import sys
 import tempfile
 import unittest
@@ -500,6 +501,111 @@ class DispatchGuardTest(unittest.TestCase):
         cfg = dg._draft_route_table(self.ws)
         self.assertIsNotNone(cfg)
         self.assertEqual(cfg["ext_routes"][".docx"], "DocAgent")
+
+    # -- policy lint (static checks at load time) ---------------------------
+
+    def _configure(self, cfg):
+        self.routes_path.write_text(json.dumps(cfg, ensure_ascii=False), encoding="utf-8")
+        self._bust_config_cache()
+        # Lint runs at config load; force the load inside the caller's
+        # assertLogs context so the warnings are captured.
+        dg._load_config()
+
+    def test_lint_flags_contradictory_keyword(self):
+        cfg = json.loads((REPO / "routes.example.json").read_text(encoding="utf-8"))
+        cfg["mode"] = "enforce"
+        cfg["routes"] = [
+            {"match": ["报告"], "agent": "DocAgent"},
+            {"match": ["报告"], "agent": "CodeAgent"},
+        ]
+        with self.assertLogs("dispatch_guard.qwenpaw", level="WARNING") as logs:
+            self._configure(cfg)
+        self.assertTrue(any("both DocAgent" in line and "CodeAgent" in line for line in logs.output))
+
+    def test_lint_flags_dead_ext_route(self):
+        # .py is deliberately a basic operation: an ext_routes entry for it can
+        # never fire, which reads like routing that does not exist.
+        cfg = json.loads((REPO / "routes.example.json").read_text(encoding="utf-8"))
+        cfg["mode"] = "enforce"
+        cfg["ext_routes"] = {".py": "CodeAgent", ".docx": "DocAgent"}
+        with self.assertLogs("dispatch_guard.qwenpaw", level="WARNING") as logs:
+            self._configure(cfg)
+        self.assertTrue(any(".py" in line and "never fire" in line for line in logs.output))
+        # the live entry stays silent
+        self.assertFalse(any(".docx" in line and "never fire" in line for line in logs.output))
+
+    def test_lint_flags_unknown_mode(self):
+        cfg = json.loads((REPO / "routes.example.json").read_text(encoding="utf-8"))
+        cfg["mode"] = "enforc"
+        with self.assertLogs("dispatch_guard.qwenpaw", level="WARNING") as logs:
+            self._configure(cfg)
+        self.assertTrue(any("'enforc'" in line for line in logs.output))
+
+    def test_lint_silent_on_clean_table(self):
+        cfg = json.loads((REPO / "routes.example.json").read_text(encoding="utf-8"))
+        cfg["mode"] = "enforce"
+        logger = logging.getLogger("dispatch_guard.qwenpaw")
+        records: list[logging.LogRecord] = []
+
+        class _Capture(logging.Handler):
+            def emit(self, record):
+                records.append(record)
+
+        handler = _Capture()
+        logger.addHandler(handler)
+        try:
+            self._configure(cfg)
+        finally:
+            logger.removeHandler(handler)
+        self.assertFalse(
+            [r for r in records if "lint" in r.getMessage()],
+            "the shipped example table must lint clean",
+        )
+
+    # -- coverage extensions (write_tools / shell_enforce) -------------------
+
+    def test_write_tools_config_extends_coverage(self):
+        # Host-specific file-producing tools (code runners, downloaders) are
+        # operator-known; write_tools lets routes.json cover them.
+        cfg = json.loads((REPO / "routes.example.json").read_text(encoding="utf-8"))
+        cfg["mode"] = "enforce"
+        cfg["write_tools"] = ["save_artifact"]
+        self._configure(cfg)
+        r = run(self.mw, "save_artifact", {"file_path": "outputs/report.docx"})
+        self.assertEqual(r[0].state, "denied")
+        # basic writes through the same tool stay free
+        r = run(self.mw, "save_artifact", {"file_path": "todo.txt"})
+        self.assertEqual(r[0].content[0].text, "ok")
+
+    def test_shell_enforce_default_off_keeps_warn(self):
+        cfg = json.loads((REPO / "routes.example.json").read_text(encoding="utf-8"))
+        cfg["mode"] = "enforce"
+        self._configure(cfg)
+        r = run(self.mw, "execute_shell_command", {"command": "echo hi > outputs/r.docx"})
+        self.assertEqual(len(r[0].content), 2, "default: warn-only")
+        self.assertNotEqual(r[0].state, "denied")
+
+    def test_shell_enforce_opt_in_denies_deliverable_output(self):
+        cfg = json.loads((REPO / "routes.example.json").read_text(encoding="utf-8"))
+        cfg["mode"] = "enforce"
+        cfg["shell_enforce"] = True
+        self._configure(cfg)
+        r = run(self.mw, "execute_shell_command", {"command": "echo '# report' > outputs/r.docx"})
+        self.assertEqual(r[0].state, "denied")
+        # basic outputs remain silent even with shell_enforce on
+        r = run(self.mw, "execute_shell_command", {"command": "echo hi > todo.txt"})
+        self.assertEqual(len(r[0].content), 1)
+
+    def test_shell_enforce_still_respects_no_owner(self):
+        self._make_agents({"CodeAgent": ["代码"]})
+        cfg = json.loads((REPO / "routes.example.json").read_text(encoding="utf-8"))
+        cfg["mode"] = "enforce"
+        cfg["shell_enforce"] = True
+        cfg["deliverable_exts"] = [".7z"]
+        cfg["ext_routes"] = {".7z": "OpsAgent"}
+        self._configure(cfg)
+        r = run(self.mw, "execute_shell_command", {"command": "tar czf - data/ > outputs/bundle.7z"})
+        self.assertNotEqual(r[0].state, "denied", "no owner, no block — even via shell")
 
 
 if __name__ == "__main__":

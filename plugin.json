@@ -1,7 +1,7 @@
 {
   "id": "dispatch-guard",
   "name": "Dispatch Guard",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "description": "Middleware that enforces an orchestrator agent's output routing at the tool seam: denies deliverable-shaped writes (deliverable dirs/extensions, outside the whitelist) with a dispatch hint, warns on shell commands producing deliverables, and backstops a disabled spawn_subagent. Reads and basic file operations are never intercepted.",
   "description_i18n": {
     "zh-CN": "在工具接缝层强制编排 agent 的产出路由：交付物形状的写入（交付物目录/扩展名，白名单外）直接拒绝并提示派发给对应 agent，shell 交付物启发式仅警告，spawn_subagent 兜底拦截。读操作与基础文件读写永不拦截。",
@@ -17,6 +17,6 @@
     "max": "2.3.0"
   },
   "meta": {
-    "notes": "No agent-facing tools. The plugin ships routes.example.json (a sanitized sample table); you write your own routes.json next to plugin.json: mode (enforce|warn|off, hot-reloaded by mtime), deliverable_dirs / deliverable_exts (what counts as a deliverable — they extend the built-in defaults), routes (keyword -> agent), ext_routes (extension -> agent). Only deliverable-shaped, non-whitelisted writes whose owner actually exists here are guarded: specialist agents are discovered from agents/*/agent.json manifests, a route naming an absent agent passes with a no_owner audit record (no owner, no block). A fresh install drafts routes.draft.json (mode=warn) from the discovered agents — review it and rename to routes.json to activate; routes.json and routes.draft.json are private, gitignored, never packaged. Reads and basic writes (notes, scripts, configs, scratch) pass untouched in every mode. Interception log: <workspace>/logs/dispatch_guard.jsonl"
+    "notes": "No agent-facing tools. The plugin ships routes.example.json (a sanitized sample table); you write your own routes.json next to plugin.json: mode (enforce|warn|off, hot-reloaded by mtime), deliverable_dirs / deliverable_exts (what counts as a deliverable — they extend the built-in defaults), shell_enforce (opt-in deny of shell commands producing deliverables, closes the redirect bypass), write_tools (extra write-capable tool names to guard), routes (keyword -> agent), ext_routes (extension -> agent). Tables are linted at load (contradictions, dead rules, unknown modes). Only deliverable-shaped, non-whitelisted writes whose owner actually exists here are guarded: specialist agents are discovered from agents/*/agent.json manifests, a route naming an absent agent passes with a no_owner audit record (no owner, no block). A fresh install drafts routes.draft.json (mode=warn) from the discovered agents' declared dispatch policy — review it and rename to routes.json to activate; routes.json and routes.draft.json are private, gitignored, never packaged. Reads and basic writes (notes, scripts, configs, scratch) pass untouched in every mode. Interception log: <workspace>/logs/dispatch_guard.jsonl (summarize with packaging/audit_summary.py). Design grounding: docs/RESEARCH.md"
   }
 }

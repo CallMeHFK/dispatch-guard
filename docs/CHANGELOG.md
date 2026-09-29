@@ -1,5 +1,36 @@
 # Changelog
 
+## v0.1.5
+
+Optimizations grounded in the recent guardrail/orchestration literature — the
+full paper-to-decision mapping now lives in [docs/RESEARCH.md](RESEARCH.md).
+
+- **Closed the shell-redirect bypass (opt-in `shell_enforce`).** A stress-test
+  evaluation of Claude Code's auto mode (2026) measured an 81% end-to-end
+  false-negative rate on a deployed tool-call gate, dominated by a *coverage
+  gap*: agents achieve a blocked effect through a path the gate does not
+  evaluate. dispatch-guard's analogue was the shell: under enforce, `echo x >
+  outputs/r.docx` only warned. With `"shell_enforce": true`, enforce mode
+  denies shell commands whose explicit output target is deliverable-shaped
+  and owned by a live agent; basic and ambiguous targets still warn. Default
+  remains off.
+- **`write_tools` extends guarded coverage to host-specific tools.** Same
+  coverage lesson: hosts grow file-producing tools (code runners,
+  downloaders) the built-in list cannot know. routes.json can now name them;
+  they then follow the exact write-tool rules (deliverable-shaped gate,
+  whitelist, no-owner stand-down).
+- **Load-time policy lint.** Following the static analyses of policy-compiler
+  work (FORGE/PC-AS, 2026), routes.json is checked when loaded: keywords
+  claimed by rules naming different agents (the earlier rule silently wins),
+  ext_routes entries that can never fire because the extension is not a
+  deliverable, and unknown `mode` values. Lint only logs — behaviour stays
+  exactly as written.
+- **`packaging/audit_summary.py`** — evidence for the warn→enforce promotion:
+  per-action counts, denials per agent, and the `no_owner` classes that name
+  specialist gaps. Per the escalation finding in the weak-to-strong
+  monitoring literature (2025), escalating only pre-flagged cases to human
+  review is where the accuracy is.
+
 ## v0.1.4
 
 - **Discovery now reads the real QwenPaw host layout.** Found during a live

@@ -2,6 +2,8 @@
   "mode": "warn",
   "deliverable_dirs": ["outputs", "projects"],
   "deliverable_exts": [],
+  "shell_enforce": false,
+  "write_tools": [],
   "routes": [
     {
       "match": ["文档", "报告", "论文", "汇报", "docx", "pdf", "markdown"],
