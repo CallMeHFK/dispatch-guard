@@ -42,8 +42,10 @@ EXCLUDE = {
 # The user's real dispatch table is private data: agent names, internal system
 # keywords, and the shape of their whole deployment. EXCLUDE filters directory
 # names only, so a root-level routes.json slips through unless checked for.
-# routes.example.json — the sanitized table shipped in the repo — is allowed.
-PRIVATE_PAYLOAD = {"routes.json"}
+# The generated draft names this environment's real agents too, so it is
+# private payload the same way. routes.example.json — the sanitized table
+# shipped in the repo — is allowed.
+PRIVATE_PAYLOAD = {"routes.json", "routes.draft.json"}
 # Fixed timestamp: a rebuild of the same commit must byte-compare equal, so a re-run
 # after a failed release job can be diffed against the asset already on GitHub.
 MEMBER_DATE = (1980, 1, 1, 0, 0, 0)
@@ -126,7 +128,10 @@ def build(plugin_id: str, version: str) -> Path:
 
     out_dir = REPO / "dist"
     out_dir.mkdir(exist_ok=True)
-    out = out_dir / f"{plugin_id}-qwenpaw-plugin.zip"
+    # Named after the plugin id, not the release: the version the host reads is
+    # the one inside plugin.json, and `releases/latest/download/{id}.zip` stays
+    # a permanent URL that never needs re-typing on upgrade.
+    out = out_dir / f"{plugin_id}.zip"
     with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as archive:
         for path in files:
             name = PurePosixPath(plugin_id, path.relative_to(REPO)).as_posix()

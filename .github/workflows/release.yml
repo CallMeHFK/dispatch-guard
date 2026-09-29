@@ -1,15 +1,67 @@
 name: Release
 
+# Two paths into the same publish job:
+#   1. auto — a push to main whose plugin.json version has no tag yet. The
+#      auto-tag job creates and pushes `v<version>`, then publish runs in this
+#      same workflow run. It cannot just "push the tag and let the tag workflow
+#      pick it up": events triggered by the GITHUB_TOKEN never trigger other
+#      workflow runs, by design.
+#   2. manual — pushing an existing v* tag (`git tag v0.1.3 && git push origin
+#      v0.1.3`) skips auto-tag and publishes that tag directly.
+#
+# The version that gets released is whatever plugin.json says; the archive name
+# carries no version (the host reads it from plugin.json inside the zip), and
+# `releases/latest/download/<id>.zip` stays a permanent install URL.
+
 on:
   push:
+    branches: [main]
     tags: ["v*"]
 
 permissions:
   contents: write
 
 jobs:
-  plugin-archive:
+  auto-tag:
+    if: github.ref_type == 'branch'
     runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Tag v<plugin.json version> when that tag does not exist yet
+        id: tag
+        run: |
+          set -euo pipefail
+          ver="$(python3 -c 'import json; print(json.load(open("plugin.json"))["version"])')"
+          if ! [[ "$ver" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "plugin.json version '$ver' is not semver; refusing to auto-tag" >&2
+            exit 1
+          fi
+          tag="v$ver"
+          if git ls-remote --exit-code --tags origin "refs/tags/$tag" >/dev/null 2>&1; then
+            echo "$tag already exists; nothing to release from this push"
+          else
+            git tag "$tag" "$GITHUB_SHA"
+            git push origin "refs/tags/$tag"
+            echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          fi
+
+  publish:
+    needs: auto-tag
+    # On a tag push auto-tag is skipped by its `if`, so the emptiness of its
+    # output alone cannot distinguish "nothing to do" from "not on main";
+    # key off the ref type as well. `!cancelled()` keeps a cancelled/skipped
+    # auto-tag from short-circuiting a manual tag push.
+    if: >-
+      !cancelled() &&
+      (
+        github.ref_type == 'tag' ||
+        needs.auto-tag.outputs.tag != ''
+      )
+    runs-on: ubuntu-latest
+    env:
+      TAG: ${{ github.ref_type == 'tag' && github.ref_name || needs.auto-tag.outputs.tag }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -20,26 +72,27 @@ jobs:
         run: python -m unittest discover -s tests
 
       - name: Build the QwenPaw plugin archive
-        run: python packaging/build_plugin_zip.py --tag "$GITHUB_REF_NAME"
+        run: python packaging/build_plugin_zip.py --tag "$TAG"
 
       - name: Publish the release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          tag="$GITHUB_REF_NAME"
-          id="$(python -c 'import json;print(json.load(open("plugin.json"))["id"])')"
-          asset="dist/$id-qwenpaw-plugin.zip"
-          url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/releases/latest/download/$id-qwenpaw-plugin.zip"
+          id="$(python3 -c 'import json;print(json.load(open("plugin.json"))["id"])')"
+          asset="dist/$id.zip"
+          url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/releases/latest/download/$id.zip"
+          digest="$(sha256sum "$asset" | cut -d' ' -f1)"
           {
-            python packaging/release_notes.py "$tag"
+            python packaging/release_notes.py "$TAG"
             printf '\n---\n\nInstall:\n\n```\nqwenpaw plugin install %s\n```\n\n' "$url"
+            printf 'sha256: `%s` (zip timestamps are fixed, so a rebuild of the tag is byte-identical)\n\n' "$digest"
             printf 'The two `Source code` archives GitHub adds automatically also install, but they unpack tests/, packaging/ and .github/ into ~/.qwenpaw/plugins/ — install this asset instead.\n'
           } > notes.md
-          if gh release view "$tag" >/dev/null 2>&1; then
-            gh release edit "$tag" --latest --notes-file notes.md
-            gh release upload "$tag" "$asset" --clobber
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release edit "$TAG" --latest --notes-file notes.md
+            gh release upload "$TAG" "$asset" --clobber
           else
-            gh release create "$tag" "$asset" --latest --title "$tag" --notes-file notes.md
+            gh release create "$TAG" "$asset" --latest --title "$TAG" --notes-file notes.md
           fi
-          gh release view "$tag" --json tagName,assets --jq '.tagName + " " + ([.assets[].name] | join(", "))'
+          gh release view "$TAG" --json tagName,assets --jq '.tagName + " " + ([.assets[].name] | join(", "))'

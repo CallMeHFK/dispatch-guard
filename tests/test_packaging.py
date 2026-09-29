@@ -24,6 +24,14 @@ class PrivatePayloadGuardTest(unittest.TestCase):
         )
         self.assertEqual(found, ["routes.json"])
 
+    def test_environment_derived_draft_is_refused(self):
+        # routes.draft.json names this environment's real agents; it is private
+        # payload exactly like the hand-written table.
+        found = bp.find_private_payload(
+            [PurePosixPath("routes.draft.json"), PurePosixPath("routes.example.json")]
+        )
+        self.assertEqual(found, ["routes.draft.json"])
+
     def test_example_table_is_allowed(self):
         self.assertEqual(bp.find_private_payload([PurePosixPath("routes.example.json")]), [])
 

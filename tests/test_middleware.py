@@ -56,6 +56,9 @@ class DispatchGuardTest(unittest.TestCase):
         self.saved_cache = dict(dg._CONFIG_CACHE)
         self.saved_plugin_dir = dg.PLUGIN_DIR
         self.saved_logged = dg._UNCONFIGURED_LOGGED
+        self.saved_agents_cache = dict(dg._AGENTS_CACHE)
+        self.saved_draft_written = dg._DRAFT_WRITTEN
+        self.saved_no_owner_logged = dg._NO_OWNER_LOGGED
         # The host installs plugins outside the agent workspace; mirroring that is
         # what keeps PLUGIN_DIR paths absolute through _rel() and lets the
         # absolute-path-only plugin whitelist fire.
@@ -73,6 +76,10 @@ class DispatchGuardTest(unittest.TestCase):
         dg._CONFIG_CACHE.update(self.saved_cache)
         dg.PLUGIN_DIR = self.saved_plugin_dir
         dg._UNCONFIGURED_LOGGED = self.saved_logged
+        dg._AGENTS_CACHE.clear()
+        dg._AGENTS_CACHE.update(self.saved_agents_cache)
+        dg._DRAFT_WRITTEN = self.saved_draft_written
+        dg._NO_OWNER_LOGGED = self.saved_no_owner_logged
         self.tmp.cleanup()
         self.plugin_tmp.cleanup()
 
@@ -81,6 +88,11 @@ class DispatchGuardTest(unittest.TestCase):
         dg._CONFIG_CACHE.clear()
         dg._CONFIG_CACHE.update({"mtime": 0.0, "data": None})
         dg._UNCONFIGURED_LOGGED = False
+        # Discovery caches per workspace; a new fake environment must not see
+        # the previous test's agents.
+        dg._AGENTS_CACHE.update({"ws": None, "agents": None, "ids": frozenset()})
+        dg._DRAFT_WRITTEN = False
+        dg._NO_OWNER_LOGGED = False
 
     def _inject_mode(self, mode):
         cfg = json.loads((REPO / "routes.example.json").read_text(encoding="utf-8"))
@@ -115,6 +127,52 @@ class DispatchGuardTest(unittest.TestCase):
         r = run(self.mw, "write_file", payload)
         self.assertEqual(r[0].content[0].text, "ok")
 
+    # -- basic operations must never be intercepted ------------------------
+
+    def test_basic_writes_pass_silently_in_enforce(self):
+        # Not whitelisted, but not deliverable-shaped either: notes, scripts,
+        # configs, scratch and extension-less files are basic operations. They
+        # pass in every mode and do not even earn a log entry.
+        for target in ("todo.txt", "scripts/setup.py", "notes.md", "Makefile", "config/app.yaml"):
+            r = run(self.mw, "write_file", {"file_path": target})
+            self.assertEqual(r[0].content[0].text, "ok", target)
+        audit = Path(self.ws) / "logs" / "dispatch_guard.jsonl"
+        self.assertFalse(audit.exists(), "basic writes must not be logged")
+
+    def test_read_operations_are_never_intercepted(self):
+        # Even a deliverable path must be freely readable — the guard governs
+        # who produces outputs, never who may look at them.
+        for name, inp in (
+            ("read_file", {"file_path": "outputs/report.docx"}),
+            ("list_dir", {"path": "outputs"}),
+            ("grep", {"pattern": "x", "path": "projects/"}),
+        ):
+            r = run(self.mw, name, inp)
+            self.assertEqual(r[0].content[0].text, "ok", name)
+
+    def test_whitelist_beats_deliverable_shape(self):
+        # tmp/ is bookkeeping scratch space: a .png there is not a deliverable.
+        r = run(self.mw, "write_file", {"file_path": "tmp/scratch.png"})
+        self.assertEqual(r[0].content[0].text, "ok")
+
+    def test_deliverable_exts_config_extends_defaults(self):
+        cfg = json.loads((REPO / "routes.example.json").read_text(encoding="utf-8"))
+        cfg["mode"] = "enforce"
+        cfg["deliverable_exts"] = [".cfg"]
+        self.routes_path.write_text(json.dumps(cfg, ensure_ascii=False), encoding="utf-8")
+        self._bust_config_cache()
+        r = run(self.mw, "write_file", {"file_path": "app.cfg"})
+        self.assertEqual(r[0].state, "denied", "custom ext must be guarded")
+        r = run(self.mw, "write_file", {"file_path": "outputs/x.docx"})
+        self.assertEqual(r[0].state, "denied", "defaults must survive a custom ext")
+
+    def test_unconfigured_mode_stays_silent_on_basic_writes(self):
+        self._fresh_plugin_tree()
+        mw = dg._factory(FakeCtx(self.ws), FakeCfg("default"))
+        r = run(mw, "write_file", {"file_path": "todo.txt"})
+        self.assertEqual(r[0].content[0].text, "ok")
+        self.assertEqual(len(r[0].content), 1, "no setup block for basic writes")
+
     def test_ascii_keyword_word_boundary(self):
         # "CI" must not match inside "asyncio".
         self.assertEqual(self.mw._route_hit("import asyncio"), (None, None))
@@ -133,6 +191,20 @@ class DispatchGuardTest(unittest.TestCase):
         self.assertEqual(len(r), 1)  # not denied
         self.assertEqual(len(r[0].content), 2)
         self.assertIn("dispatch-guard warn", r[0].content[1].text)
+
+    def test_shell_redirect_into_deliverable_warns(self):
+        r = run(self.mw, "execute_shell_command", {"command": "echo '# hi' > outputs/README.md"})
+        self.assertEqual(len(r[0].content), 2)
+        self.assertIn("dispatch-guard warn", r[0].content[1].text)
+
+    def test_shell_basic_output_is_silent(self):
+        # Redirects into notes/scripts/configs are basic operations — the old
+        # heuristic warned on any .md/.py redirect, which is exactly the noise
+        # this plugin must not make.
+        r = run(self.mw, "execute_shell_command", {
+            "command": "echo hi > todo.txt && cat a.md > summary.md && python gen.py > app.cfg 2>&1"
+        })
+        self.assertEqual(len(r[0].content), 1)
 
     def test_shell_benign_passthrough(self):
         r = run(self.mw, "execute_shell_command", {"command": "ls -la && git status"})
@@ -207,6 +279,123 @@ class DispatchGuardTest(unittest.TestCase):
             self.assertEqual(dg._load_config()["mode"], "off")
             self.assertIsNone(dg._factory(FakeCtx(self.ws), FakeCfg("default")))
         self.assertTrue(any("failing open" in line for line in logs.output))
+
+    # -- environment discovery: no owner, no block --------------------------
+
+    def _make_agents(self, spec):
+        """Write a fake agent inventory into the workspace, host-style."""
+        for aid, skills in spec.items():
+            d = Path(self.ws) / "agents" / aid
+            d.mkdir(parents=True, exist_ok=True)
+            (d / "agent.json").write_text(
+                json.dumps({"id": aid, "skills": skills, "description": ""}, ensure_ascii=False),
+                encoding="utf-8",
+            )
+
+    def _audit_records(self):
+        path = Path(self.ws) / "logs" / "dispatch_guard.jsonl"
+        if not path.exists():
+            return []
+        return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+
+    def test_discovery_reads_workspace_agents(self):
+        self._make_agents({"DocAgent": ["文档", "报告"], "CodeAgent": ["代码"]})
+        ids = {a["id"] for a in dg._discover_agents(self.ws)}
+        self.assertEqual(ids, {"DocAgent", "CodeAgent"})
+
+    def test_stale_route_to_absent_agent_stands_down(self):
+        # The example table routes .docx -> DocAgent, but this environment has
+        # no DocAgent. Denying would strand the deliverable with nowhere to
+        # dispatch to, so the write passes and the audit says no_owner.
+        self._make_agents({"CodeAgent": ["代码"]})
+        r = run(self.mw, "write_file", {"file_path": "outputs/report.docx"})
+        self.assertNotEqual(r[0].state, "denied")
+        self.assertEqual(len(r[0].content), 1, "no warning block: there is no agent to name")
+        self.assertEqual(self._audit_records()[-1]["action"], "no_owner")
+
+    def test_live_route_still_denies(self):
+        self._make_agents({"DocAgent": ["文档"]})
+        r = run(self.mw, "write_file", {"file_path": "outputs/report.docx"})
+        self.assertEqual(r[0].state, "denied")
+        self.assertIn("DocAgent", r[0].content[0].text)
+
+    def test_empty_discovery_trusts_the_table(self):
+        # No agent manifests anywhere we can read: discovery cannot judge the
+        # deployment, so the operator's table applies verbatim (pre-discovery
+        # behaviour) instead of silently disarming the guard.
+        r = run(self.mw, "write_file", {"file_path": "outputs/report.docx"})
+        self.assertEqual(r[0].state, "denied")
+
+    def test_specialists_exist_but_none_owns_the_class(self):
+        # The motivating scenario: a real multi-agent env with no doc/design
+        # specialist. Poster writes must pass even in enforce mode.
+        self._make_agents({"CodeAgent": ["代码"]})
+        r = run(self.mw, "write_file", {"file_path": "outputs/poster.svg"})
+        self.assertNotEqual(r[0].state, "denied")
+        self.assertEqual(len(r[0].content), 1)
+        self.assertEqual(self._audit_records()[-1]["action"], "no_owner")
+
+    def test_shell_no_owner_is_silent(self):
+        self._make_agents({"CodeAgent": ["代码"]})
+        r = run(self.mw, "execute_shell_command", {"command": "echo hi > outputs/banner.svg"})
+        self.assertEqual(len(r[0].content), 1)
+
+    # -- draft generation from the environment ------------------------------
+
+    def test_unconfigured_generates_draft_from_environment(self):
+        self._fresh_plugin_tree()
+        self._make_agents({"DocAgent": ["文档", "报告"], "CodeAgent": ["代码"]})
+        mw = dg._factory(FakeCtx(self.ws), FakeCfg("default"))
+        self.assertIsNotNone(mw)
+
+        draft = self.plugin_tree / "routes.draft.json"
+        self.assertTrue(draft.exists(), "attach must draft a table when agents are visible")
+        cfg = json.loads(draft.read_text(encoding="utf-8"))
+        self.assertEqual(cfg["mode"], "warn", "a draft never activates enforce by itself")
+        self.assertEqual(cfg["ext_routes"][".docx"], "DocAgent")
+        self.assertNotIn(".svg", cfg["ext_routes"], "no design agent -> media group stays unrouted")
+        self.assertFalse((self.plugin_tree / "routes.json").exists())
+
+        # Unconfigured still never denies; the setup block now names the draft.
+        r = run(mw, "write_file", {"file_path": "outputs/report.docx"})
+        self.assertNotEqual(r[0].state, "denied")
+        self.assertIn("routes.draft.json", r[0].content[1].text)
+
+    def test_draft_confirmed_then_enforces_end_to_end(self):
+        # Full onboarding: env -> draft -> review/rename -> warn -> enforce,
+        # with basics and ownerless classes passing throughout.
+        self._fresh_plugin_tree()
+        self._make_agents({"DocAgent": ["文档"]})
+        dg._factory(FakeCtx(self.ws), FakeCfg("default"))
+        draft = self.plugin_tree / "routes.draft.json"
+        self.assertTrue(draft.exists())
+
+        # Operator reviews, keeps warn, renames to activate.
+        cfg = json.loads(draft.read_text(encoding="utf-8"))
+        self.assertEqual(cfg["mode"], "warn")
+        self.routes_path.write_text(json.dumps(cfg, ensure_ascii=False), encoding="utf-8")
+        self._bust_config_cache()
+        r = run(self.mw, "write_file", {"file_path": "outputs/x.docx"})
+        self.assertEqual(len(r[0].content), 2)
+        self.assertIn("DocAgent", r[0].content[1].text)
+
+        # Confidence earned: flip to enforce.
+        cfg["mode"] = "enforce"
+        self.routes_path.write_text(json.dumps(cfg, ensure_ascii=False), encoding="utf-8")
+        self._bust_config_cache()
+        self.assertEqual(run(self.mw, "write_file", {"file_path": "outputs/x.docx"})[0].state, "denied")
+        # And the two stand-down guarantees hold under enforce:
+        self.assertEqual(run(self.mw, "write_file", {"file_path": "todo.txt"})[0].content[0].text, "ok")
+        r = run(self.mw, "write_file", {"file_path": "outputs/poster.svg"})
+        self.assertNotEqual(r[0].state, "denied")
+
+    def test_unconfigured_without_specialists_writes_no_draft(self):
+        self._fresh_plugin_tree()
+        mw = dg._factory(FakeCtx(self.ws), FakeCfg("default"))
+        self.assertFalse((self.plugin_tree / "routes.draft.json").exists())
+        self.assertIsNotNone(mw)
+        r = run(mw, "write_file", {"file_path": "outputs/x.docx"})
+        self.assertIn("routes.example.json", r[0].content[1].text)
 
 
 if __name__ == "__main__":

@@ -17,7 +17,7 @@ imports to local stand-ins, so the suite runs on a bare interpreter.
 git clone https://github.com/CallMeHFK/dispatch-guard.git
 cd dispatch-guard
 python -m unittest discover -s tests -v
-python packaging/build_plugin_zip.py      # dist/dispatch-guard-qwenpaw-plugin.zip
+python packaging/build_plugin_zip.py      # dist/dispatch-guard.zip
 ```
 
 Try it against a real host by copying the checkout into the plugin directory
@@ -71,8 +71,11 @@ knowing before you write one:
 
 - Branch names: `fix/<topic>`, `feat/<topic>`, `docs/<topic>`.
 - Commit messages: imperative summary, body for the *why*. One logical change per commit.
-- Bump `version` in `plugin.json` and add a `### vX.Y.Z` section to
-  `docs/CHANGELOG.md` in the same PR; cutting a tag publishes the archive.
+- Bump `version` in `plugin.json` and add a `## vX.Y.Z` section (newest first)
+  to `docs/CHANGELOG.md` in the same PR — pushing that to `main` releases
+  automatically: the workflow tags `vX.Y.Z`, runs the suite, builds the archive
+  and publishes it. Release-hygiene tests fail the release when the changelog
+  section is missing. Pushing a `v*` tag by hand is the manual equivalent.
 - Use the provided issue and PR templates.
 
 ## Where to ask

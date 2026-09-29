@@ -1,5 +1,7 @@
 {
   "mode": "warn",
+  "deliverable_dirs": ["outputs", "projects"],
+  "deliverable_exts": [],
   "routes": [
     {
       "match": ["文档", "报告", "论文", "汇报", "docx", "pdf", "markdown"],
@@ -31,14 +33,11 @@
     ".pptx": "DocAgent",
     ".xlsx": "DocAgent",
     ".pdf": "DocAgent",
-    ".py": "CodeAgent",
     ".svg": "DesignAgent",
     ".png": "DesignAgent",
     ".mp4": "DesignAgent",
     ".dxf": "HardwareAgent",
     ".gcode": "HardwareAgent",
-    ".sdf": "HardwareAgent",
-    ".srdf": "HardwareAgent",
     ".step": "HardwareAgent",
     ".kicad_pcb": "HardwareAgent"
   }

@@ -1,5 +1,59 @@
 # Changelog
 
+## v0.1.3
+
+- **No owner, no block.** A denial is only useful if it names a dispatch
+  target that exists. The guard now discovers the environment's specialist
+  agents (from `agents/*/agent.json` manifests in the workspace and the
+  host-level agents directory) and validates every route against that
+  inventory before blocking: a route naming an absent agent — or a
+  deliverable class no discovered agent owns — passes untouched and is
+  recorded as `no_owner` in the audit log. Blocking a write you cannot route
+  just strands the deliverable. An *empty* discovery does not disarm the
+  guard: an unreadable deployment falls back to trusting the operator's table
+  verbatim.
+- **Fresh installs get a drafted table, not an interrogation.** In
+  `unconfigured` mode the plugin scans the discovered agents'
+  id/skills/description and generates `routes.draft.json` (`mode=warn`) from
+  deliverable categories: each category routes to the first agent that
+  mentions it, and categories with no matching agent stay unrouted. The
+  plugin never writes `routes.json` itself — activation is an explicit
+  rename after review. The draft names real agents, so it is gitignored and
+  the build refuses to package it, exactly like the hand-written table.
+- **Basic operations are no longer intercepted.** Previously every write
+  outside the whitelist was treated as a deliverable, so `enforce` denied
+  ordinary file operations (a root `notes.md`, `scripts/setup.py`, a
+  `Makefile`). The guard now only sees **deliverable-shaped** targets: under
+  `outputs/`/`projects/` (configurable via `deliverable_dirs`) or carrying a
+  deliverable extension such as `.docx` (configurable via `deliverable_exts`,
+  which extends the built-in list). Reads, whitelist writes, and all other
+  basic file operations pass untouched in every mode, without log entries —
+  and the middleware still attaches to the default agent only, so no other
+  agent was ever touched.
+- The shell heuristic now shares the same deliverable predicate: a redirect
+  into a notes file or a script stays silent (`.py`/`.md` no longer count as
+  deliverables), while `pandoc -o outputs/r.docx` and redirects into
+  deliverable targets still warn. Shell remains warn-only in every mode.
+- **Releases are now automatic.** Pushing a version bump to `main` (a changed
+  `plugin.json` version with no matching tag) makes the release workflow tag
+  `v<version>` itself, run the suite, build the archive and publish the GitHub
+  release — no manual tagging step. Pushing a `v*` tag by hand still works.
+- **Fixed: release notes were placeholders.** `release_notes.py` looked for a
+  `### vX.Y.Z` heading while the changelog uses `## vX.Y.Z`, so every release
+  page would have carried the "See docs/CHANGELOG.md" filler instead of the
+  actual notes. The extractor now accepts both levels and a regression test
+  pins it to the real changelog.
+- The release asset is named after the plugin (`dispatch-guard.zip`), matching
+  the stable-URL convention of agent-shepherd: the version lives inside
+  `plugin.json` where the host reads it, and
+  `releases/latest/download/dispatch-guard.zip` never changes between releases.
+  The release notes also carry the archive's sha256.
+- New release-hygiene tests (pattern from agent-shepherd's
+  `test_release_hygiene.py`): `plugin.json` version must equal the newest
+  changelog section, the changelog section must actually be extractable as
+  release notes, and the README's install URL must name the real asset.
+- CI now runs `ruff check .` (pinned to 0.16.8) alongside the test matrix.
+
 ## v0.1.2
 
 - **The repository no longer ships a dispatch table.** `routes.json` is private
