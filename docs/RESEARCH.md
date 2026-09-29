@@ -1,9 +1,9 @@
 # dispatch-guard research notes
 
 The design decisions in this plugin are grounded in recent literature on LLM
-multi-agent orchestration and runtime guardrails (2015–2026 arXiv preprints
-unless noted). This file maps each paper's finding to what it validates or
-changed here, so design discussions start from evidence instead of taste.
+multi-agent orchestration and runtime guardrails (2024–2026 unless noted).
+This file maps each paper's finding to what it validates or changed here, so
+design discussions start from evidence instead of taste.
 
 ## The failure mode is real and documented
 
@@ -40,10 +40,15 @@ changed here, so design discussions start from evidence instead of taste.
   ambiguous workloads largely because of a **coverage gap** — "agents
   routinely achieve equivalent effects through [paths] the classifier does
   not evaluate", e.g. falling back to file edits when the expected CLI is
-  unavailable. Consequences adopted in v0.1.5:
+  unavailable. Consequences adopted (v0.1.5–v0.1.6):
   - `write_tools` (routes.json) lets operators extend the guarded tool set
     with host-specific file-producing tools instead of assuming the built-in
-    list is complete.
+    list is complete. Because those tools carry paths inside code arguments,
+    v0.1.6 scans the input body itself with two confidence tiers: an
+    *explicit* write target (redirect/tee/`-o`/cp-family destination — also
+    how v0.1.6 closed the shell copy bypass) is treated like a write-tool
+    path and can be denied; a quoted *mention* only ever warns, because a
+    mention proves visibility, not effect.
   - `shell_enforce` (opt-in) narrows the biggest known hole in this plugin —
     shell redirects into deliverable targets were warn-only, which is exactly
     the "agent routes around the gate through another path" pattern. Default

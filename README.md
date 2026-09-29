@@ -171,6 +171,15 @@ so `enforce ↔ warn` flips apply mid-session with no restart. `off` is the
 exception: it is decided by the factory when the agent is built, so switching
 *back* from `off` needs a new agent instance (a fresh session).
 
+**Two coverage tiers.** A target that is *explicitly written to* — a redirect
+(`>` / `>>` / `tee`), a converter `-o`, or the destination of `cp`/`mv`/`rsync`
+— is treated like a write-tool call: warned by default, denied when the mode
+allows it (shell targets additionally need `shell_enforce`). A deliverable path
+that is merely *mentioned* in a quoted string (inside a command, or inside the
+argument of a `write_tools`-declared code runner) only ever earns a warning:
+a mention proves the path was visible, not that bytes will land there, and
+blocking on guesses is how a guard strands legitimate work.
+
 Routing hints: `routes.json` maps extensions (`ext_routes`, checked first) and
 keywords (`routes`) to agent ids, so the denial names a concrete owner instead of
 a generic refusal. Pure-ASCII keywords match on word boundaries (`CI` does not
@@ -211,10 +220,11 @@ The sample uses placeholder agent ids; replace them with your own:
                              // (extends the built-in list, never replaces it)
   "shell_enforce": false,    // opt-in: in enforce mode, DENY shell commands whose
                              // explicit output target is a deliverable owned by a
-                             // live agent (closes the shell-redirect bypass; see
+                             // live agent (closes the redirect/copy bypass; see
                              // docs/RESEARCH.md → permission-gate coverage gap)
   "write_tools": [],         // extra write-capable tool names to guard (host tools
-                             // that produce files, e.g. code runners, downloaders)
+                             // that produce files, e.g. code runners, downloaders;
+                             // paths inside their arguments are scanned too)
   "routes": [                // keyword -> owning agent (CJK substring, ASCII word-boundary)
     {"match": ["文档", "报告", "docx", "pdf"], "agent": "DocAgent"},
     {"match": ["代码", "refactor", "debug", "CI"], "agent": "CodeAgent"}

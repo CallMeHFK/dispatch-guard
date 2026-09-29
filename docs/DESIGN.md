@@ -21,12 +21,20 @@ the audit log for later tuning.
 One caveat earned in the field: the permission-gate stress-test of Claude
 Code's auto mode (see docs/RESEARCH.md) showed that agents under a gate
 route around it through whatever path the gate does not evaluate — here, a
-shell redirect into the deliverable target. That is why v0.1.5 adds an
+shell redirect into the deliverable target. That is why v0.1.5 added an
 opt-in `shell_enforce`: when it is on, enforce mode denies the *unambiguous*
 shapes only (an explicit output target that is deliverable-shaped and owned
-by a live agent); ambiguous or basic targets still just warn. The default
-remains warn-only, because a content-based shell heuristic plus a blanket
-deny is how a guard becomes the reason work stops.
+by a live agent); ambiguous or basic targets still just warn.
+
+Coverage is tiered by what the command actually proves. An *explicit* output
+target (redirect, tee, converter `-o`, or the destination of `cp`/`mv`/`rsync`)
+is where bytes land — the same reliability as a write-tool path argument, so
+it follows the full write rules and can be denied. A deliverable path merely
+*mentioned* in a quoted string (shell-embedded code, a code-runner's argument)
+proves visibility but not effect — grep for `report.docx` is not writing
+`report.docx` — so mentions warn and are never denied, even with
+`shell_enforce` on. The tiers exist because the coverage lesson demands seeing
+the second class of paths while the fail-open rule demands not acting on them.
 
 ## Why only deliverable-shaped writes
 

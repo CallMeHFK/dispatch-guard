@@ -1,5 +1,25 @@
 # Changelog
 
+## v0.1.6
+
+- Review fixes to v0.1.5's coverage features — which had half-applied the
+  permission-gate lesson they were built on:
+  - `write_tools` now covers pathless tools. A code runner names its
+    deliverable inside the argument body, not in a path field, so declaring
+    it used to be fake coverage: the tool was intercepted but nothing was
+    ever recognized. The input body is now scanned with the same patterns as
+    the shell.
+  - Shell explicit targets now include `cp`/`mv`/`rsync`/`install`
+    destinations — moving a generated deliverable bypassed detection
+    entirely, even with `shell_enforce` on.
+  - Two confidence tiers: an *explicit* write target (redirect/tee/-o/cp
+    destination) follows the full write rules and can be denied; a quoted
+    *mention* of a deliverable path (shell-embedded code, grep arguments)
+    warns but is never denied — a mention proves visibility, not effect.
+- `audit_summary.py` attribution now ignores spawn-backstop denials, which
+  name no dispatch agent and previously polluted the per-agent tally.
+- Corrected the literature window stated in `docs/RESEARCH.md`.
+
 ## v0.1.5
 
 Optimizations grounded in the recent guardrail/orchestration literature — the

@@ -607,6 +607,64 @@ class DispatchGuardTest(unittest.TestCase):
         r = run(self.mw, "execute_shell_command", {"command": "tar czf - data/ > outputs/bundle.7z"})
         self.assertNotEqual(r[0].state, "denied", "no owner, no block — even via shell")
 
+    # -- coverage tiers: explicit write targets vs quoted mentions -----------
+
+    def test_shell_cp_destination_is_an_explicit_target(self):
+        # A copy destination is where the bytes land: warn-only by default,
+        # denied with shell_enforce — closing the bypass where an agent under
+        # enforce moves a generated deliverable instead of redirecting it.
+        cmd = {"command": "cp /tmp/gen.docx outputs/report.docx"}
+        cfg = json.loads((REPO / "routes.example.json").read_text(encoding="utf-8"))
+        cfg["mode"] = "enforce"
+        self._configure(cfg)
+        r = run(self.mw, "execute_shell_command", cmd)
+        self.assertEqual(len(r[0].content), 2, "default: warn only")
+        self.assertNotEqual(r[0].state, "denied")
+        cfg["shell_enforce"] = True
+        self._configure(cfg)
+        r = run(self.mw, "execute_shell_command", cmd)
+        self.assertEqual(r[0].state, "denied")
+
+    def test_quoted_mention_in_shell_warns_but_never_denies(self):
+        # A path inside a quoted string is a mention (open('outputs/x.docx'…)):
+        # enough to flag, never enough to block — a grep for a filename is not
+        # a write, and mention-tier denials would wedge legitimate work.
+        cfg = json.loads((REPO / "routes.example.json").read_text(encoding="utf-8"))
+        cfg["mode"] = "enforce"
+        cfg["shell_enforce"] = True
+        self._configure(cfg)
+        r = run(self.mw, "execute_shell_command", {
+            "command": "python -c \"open('outputs/x.docx','w').write('hi')\""
+        })
+        self.assertEqual(len(r), 1)
+        self.assertNotEqual(r[0].state, "denied")
+        self.assertEqual(len(r[0].content), 2)
+        self.assertIn("提到", r[0].content[1].text)
+
+    def test_pathless_write_tools_are_scanned_not_skipped(self):
+        # Declaring a code-runner-style tool in write_tools without scanning
+        # its input body would be a fake coverage: the path lives in the code.
+        cfg = json.loads((REPO / "routes.example.json").read_text(encoding="utf-8"))
+        cfg["mode"] = "enforce"
+        cfg["write_tools"] = ["run_python"]
+        self._configure(cfg)
+        # explicit output shape inside the argument -> full write-tool flow
+        r = run(self.mw, "run_python", {"script": "subprocess: pandoc a.md -o outputs/r.docx"})
+        self.assertEqual(r[0].state, "denied")
+        # quoted mention -> warn only
+        r = run(self.mw, "run_python", {"code": "open('outputs/x.docx','w')"})
+        self.assertNotEqual(r[0].state, "denied")
+        self.assertEqual(len(r[0].content), 2)
+        # code that mentions nothing deliverable stays silent
+        r = run(self.mw, "run_python", {"code": "print('42')"})
+        self.assertEqual(len(r[0].content), 1)
+
+    def test_bare_string_path_input_still_counts_as_path(self):
+        # Host variants of write tools may pass the path as a bare string;
+        # that is an explicit target, not a mention.
+        r = run(self.mw, "write_file", "outputs/report.docx")
+        self.assertEqual(r[0].state, "denied")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -29,10 +29,13 @@ from pathlib import Path
 def summarize(records: list[dict]) -> dict:
     actions = Counter(str(r.get("action", "?")) for r in records)
     modes = Counter(str(r.get("mode", "?")) for r in records)
+    # Only deny messages that actually name a dispatch target count toward
+    # the per-agent tally; the spawn backstop denial routes to no agent and
+    # would otherwise pollute the attribution.
     hints = Counter(
-        str(r.get("message", "")).split("派发给 ")[-1].split("；")[0].split(" ")[0]
-        for r in records
-        if r.get("action") == "denied"
+        message.split("派发给 ")[-1].split("；")[0].split(" ")[0]
+        for message in (str(r.get("message", "")) for r in records if r.get("action") == "denied")
+        if "派发给 " in message
     )
     no_owner = Counter(str(r.get("target", "?")) for r in records if r.get("action") == "no_owner")
     top_targets = Counter(str(r.get("target", "?")) for r in records)

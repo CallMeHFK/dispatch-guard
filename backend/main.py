@@ -135,15 +135,25 @@ WHITELIST_FILES = {
     "agent.json",
 }
 
-# Command-line shapes that name an output FILE (redirect, tee, or a converter's
-# -o). Whether that file is a deliverable is decided by _is_deliverable(), not
-# here — so a redirect into a notes file never trips the heuristic.
+# Command-line shapes that name an output FILE (redirect, tee, a converter's
+# -o, or the destination of cp/mv/rsync/install). Whether that file is a
+# deliverable is decided by _is_deliverable(), not here — so a redirect into
+# a notes file never trips the heuristic. The cp-family pattern is greedy so
+# the captured token is the segment's last argument = the destination.
 SHELL_OUTPUT_PATTERNS = (
     re.compile(r"(?:>>|\btee\b(?:\s+-\w+)*\s+|>)\s*([^\s;&|]+)", re.I),
     re.compile(
         r"\b(?:pandoc|ffmpeg|soffice|libreoffice)\b[^;&|]*?-o\s+([^\s;&|]+)", re.I
     ),
+    re.compile(r"\b(?:cp|mv|rsync|install)\b[^;&|]*\s+([^\s;&|]+)", re.I),
 )
+# Quoted file paths appearing anywhere in a command or code body. A path in
+# a quoted string is a MENTION — it names a deliverable the tool may write
+# (code runners take their paths inside the code argument), but it may also
+# be a probe, a test fixture name, or prose. Mentions earn a warning, never
+# a denial: the permission-gate literature's coverage lesson is about seeing
+# these paths, and the fail-open rule is about not stranding work on a guess.
+MENTION_PATH_RE = re.compile(r"""["']([^"'`]*\.[A-Za-z0-9]{1,12})["']""")
 
 _CONFIG_CACHE: dict[str, Any] = {"mtime": 0.0, "data": None}
 _UNCONFIGURED_LOGGED = False
@@ -556,7 +566,13 @@ class DispatchGuardMiddleware(MiddlewareBase):
             logger.exception("dispatch-guard: log write failed")
 
     @staticmethod
-    def _target_of(tool_input: Any) -> str:
+    def _target_of(tool_input: Any) -> tuple[str, bool]:
+        """(target, is_path): the path argument if the tool names one.
+
+        is_path=False means the input has no file argument — for code-runner
+        style tools the deliverable path, if any, lives inside the code/text
+        body, which _scan_candidates() inspects instead.
+        """
         if isinstance(tool_input, str):
             stripped = tool_input.strip()
             if stripped.startswith("{"):
@@ -564,12 +580,39 @@ class DispatchGuardMiddleware(MiddlewareBase):
                     tool_input = json.loads(stripped)
                 except (ValueError, TypeError):
                     pass
+        if isinstance(tool_input, str):
+            return tool_input, True
         if isinstance(tool_input, dict):
             for key in ("file_path", "path", "filename", "file"):
                 if key in tool_input:
-                    return str(tool_input[key])
-            return json.dumps(tool_input, ensure_ascii=False)
-        return str(tool_input)
+                    return str(tool_input[key]), True
+            return json.dumps(tool_input, ensure_ascii=False), False
+        return str(tool_input), False
+
+    def _scan_candidates(self, blob: str, cfg: dict[str, Any]) -> list[tuple[str, bool]]:
+        """(rel, explicit) deliverable-shaped paths named inside a blob.
+
+        Two confidence tiers, ordered explicit-first: an explicit output
+        target (redirect/tee/-o/cp-destination) is where bytes land and may
+        be denied under the right mode; a quoted path is only a mention —
+        enough to warn about, never enough to block.
+        """
+        found: list[tuple[str, bool]] = []
+        seen: set[str] = set()
+        for pattern in SHELL_OUTPUT_PATTERNS:
+            for match in pattern.finditer(blob):
+                rel = self._rel(match.group(1).strip("\"'"))
+                if rel in seen or self._whitelisted(rel) or not self._is_deliverable(rel, cfg):
+                    continue
+                seen.add(rel)
+                found.append((rel, True))
+        for match in MENTION_PATH_RE.finditer(blob):
+            rel = self._rel(match.group(1))
+            if rel in seen or self._whitelisted(rel) or not self._is_deliverable(rel, cfg):
+                continue
+            seen.add(rel)
+            found.append((rel, False))
+        return found
 
     def _rel(self, target: str) -> str:
         try:
@@ -673,6 +716,66 @@ class DispatchGuardMiddleware(MiddlewareBase):
         async for event in next_handler():
             yield event
 
+    async def _guard_target(
+        self,
+        rel: str,
+        *,
+        tool_name: str,
+        mode: str,
+        cfg: dict[str, Any],
+        next_handler: Callable[..., AsyncGenerator[Any, None]],
+        allow_deny: bool,
+        source: str,
+    ) -> AsyncGenerator[Any, None]:
+        """The single decision path for a deliverable-shaped target.
+
+        Used by both branches (write tools with a path argument, and
+        explicit/mentioned targets scanned out of command lines or code
+        bodies). `allow_deny` carries the confidence/mode policy: only
+        explicit write targets may ever be denied, and shell targets need
+        the opt-in `shell_enforce`; mentions never deny.
+        """
+        if mode == UNCONFIGURED:
+            async for event in self._warn_and_pass(
+                self._setup_hint(rel),
+                tool_name,
+                rel,
+                mode,
+                next_handler,
+                action="needs_config",
+            ):
+                yield event
+            return
+        agent_id, why = self._route_hit(rel)
+        owner, blockable = self._live_owner(agent_id)
+        if not blockable:
+            async for event in self._no_owner_pass(
+                f"no live owner for {rel}", tool_name, rel, mode, next_handler
+            ):
+                yield event
+            return
+        hint = owner or "对应专业 agent"
+        if allow_deny and mode == "enforce":
+            yield self._deny(
+                f"该产出属于 {hint} 域（命中 {why or '交付物路径'}），"
+                f"请用 submit_to_agent 派发给 {hint}；"
+                f"如确属编排/元操作，请与用户确认后加入白名单。目标：{rel}",
+                tool_name,
+                rel,
+                mode,
+            )
+            return
+        async for event in self._warn_and_pass(
+            f"[dispatch-guard warn] {source} {rel} 命中 {hint}"
+            f"（{why or '交付物路径'}）；enforce 模式下交付物写入将被拒绝，"
+            f"请改用 submit_to_agent 派发。",
+            tool_name,
+            rel,
+            mode,
+            next_handler,
+        ):
+            yield event
+
     def _route_hit(self, blob: str) -> tuple[str | None, str | None]:
         cfg = _load_config()
         ext = os.path.splitext(blob)[1].lower()
@@ -746,7 +849,7 @@ class DispatchGuardMiddleware(MiddlewareBase):
         tool_call = input_kwargs.get("tool_call")
         name = getattr(tool_call, "name", "") or ""
         raw_input = getattr(tool_call, "input", "") or ""
-        target = self._target_of(raw_input)
+        target, target_is_path = self._target_of(raw_input)
 
         if name in SPAWN_TOOLS:
             yield self._deny(
@@ -759,50 +862,35 @@ class DispatchGuardMiddleware(MiddlewareBase):
             return
 
         if name in _write_tools(cfg):
-            rel = self._rel(target)
             # Whitelisted bookkeeping writes and every non-deliverable write
             # (notes, scripts, configs, scratch, extension-less files) are
             # basic operations: they pass untouched in every mode, without a
             # log entry. Only deliverable-shaped targets are the guard's
-            # business.
-            if not self._whitelisted(rel) and self._is_deliverable(rel, cfg):
-                if mode == UNCONFIGURED:
-                    async for event in self._warn_and_pass(
-                        self._setup_hint(rel),
-                        name,
-                        rel,
-                        mode,
-                        next_handler,
-                        action="needs_config",
-                    ):
-                        yield event
-                    return
-                agent_id, why = self._route_hit(rel)
-                owner, blockable = self._live_owner(agent_id)
-                if not blockable:
-                    async for event in self._no_owner_pass(
-                        f"no live owner for {rel}", name, rel, mode, next_handler
-                    ):
-                        yield event
-                    return
-                hint = owner or "对应专业 agent"
-                if mode == "enforce":
-                    yield self._deny(
-                        f"该产出属于 {hint} 域（命中 {why or '交付物路径'}），"
-                        f"请用 submit_to_agent 派发给 {hint}；"
-                        f"如确属编排/元操作，请与用户确认后加入白名单。目标：{rel}",
-                        name,
-                        rel,
-                        mode,
-                    )
-                    return
-                async for event in self._warn_and_pass(
-                    f"[dispatch-guard warn] 写入交付物 {rel} 命中 {hint}"
-                    f"（{why or '交付物路径'}），enforce 模式下将被拒绝并提示派发。",
-                    name,
+            # business. A tool without a path argument (a code runner, a
+            # downloader) is still guarded: its deliverable paths, if any,
+            # are scanned out of the input body — explicit write shapes may
+            # deny, quoted mentions only warn.
+            rel: str | None = None
+            explicit = False
+            source = "写入交付物"
+            if target_is_path:
+                candidate = self._rel(target)
+                if not self._whitelisted(candidate) and self._is_deliverable(candidate, cfg):
+                    rel, explicit = candidate, True
+            else:
+                found = self._scan_candidates(target, cfg)
+                if found:
+                    rel, explicit = found[0]
+                    source = "参数/代码中出现交付物路径" if not explicit else "生成交付物"
+            if rel is not None:
+                async for event in self._guard_target(
                     rel,
-                    mode,
-                    next_handler,
+                    tool_name=name,
+                    mode=mode,
+                    cfg=cfg,
+                    next_handler=next_handler,
+                    allow_deny=explicit,
+                    source=source,
                 ):
                     yield event
                 return
@@ -816,63 +904,20 @@ class DispatchGuardMiddleware(MiddlewareBase):
                 )
             else:
                 cmd = str(raw_input)
-            # Heuristic: does the command name an output FILE at all? Only then
-            # does deliverable-ness matter — `echo hi > todo.txt` is a basic
-            # operation and must stay silent, `pandoc -o outputs/r.docx` is not.
-            hit = None
-            for pattern in SHELL_OUTPUT_PATTERNS:
-                for match in pattern.finditer(cmd):
-                    candidate = match.group(1).strip("\"'")
-                    rel = self._rel(candidate)
-                    if self._whitelisted(rel) or not self._is_deliverable(rel, cfg):
-                        continue
-                    hit = rel
-                    break
-                if hit:
-                    break
-            if hit:
-                if mode == UNCONFIGURED:
-                    async for event in self._warn_and_pass(
-                        self._setup_hint(hit[:120]),
-                        name,
-                        hit[:120],
-                        mode,
-                        next_handler,
-                        action="needs_config",
-                    ):
-                        yield event
-                    return
-                agent_id, why = self._route_hit(hit)
-                owner, blockable = self._live_owner(agent_id)
-                if not blockable:
-                    async for event in self._no_owner_pass(
-                        f"no live owner for {hit[:120]}", name, hit[:120], mode, next_handler
-                    ):
-                        yield event
-                    return
-                hint = owner or "对应专业 agent"
-                if mode == "enforce" and _shell_enforce(cfg):
-                    # Opt-in (routes.json "shell_enforce": true): close the
-                    # documented bypass where an agent under enforce produces
-                    # the deliverable through a shell redirect instead of
-                    # write_file. Only the unambiguous shapes reach this path
-                    # (explicit output target, deliverable-shaped, live owner).
-                    yield self._deny(
-                        f"该产出属于 {hint} 域（shell 生成/覆盖交付物：{why or '交付物路径'}），"
-                        f"请改用 submit_to_agent 派发给 {hint}。目标：{hit}",
-                        name,
-                        hit[:120],
-                        mode,
-                    )
-                    return
-                async for event in self._warn_and_pass(
-                    f"[dispatch-guard warn] 命令疑似生成或覆盖交付物（{hit[:80]}），"
-                    f"命中 {hint}（{why or '交付物路径'}）；enforce 模式下写交付物将被拒绝，"
-                    f"请改用 submit_to_agent 派发。",
-                    name,
-                    hit[:120],
-                    mode,
-                    next_handler,
+            found = self._scan_candidates(cmd, cfg)
+            if found:
+                rel, explicit = found[0]
+                async for event in self._guard_target(
+                    rel,
+                    tool_name=name,
+                    mode=mode,
+                    cfg=cfg,
+                    next_handler=next_handler,
+                    # deny needs BOTH the unambiguous shape and the opt-in;
+                    # a mention in a command never blocks (grep for a file
+                    # name is not a write).
+                    allow_deny=explicit and _shell_enforce(cfg),
+                    source="命令生成或覆盖交付物" if explicit else "命令中提到交付物路径",
                 ):
                     yield event
                 return
