@@ -1,5 +1,29 @@
 # Changelog
 
+## v0.1.4
+
+- **Discovery now reads the real QwenPaw host layout.** Found during a live
+  test on a production install: agents live one-per-workspace at
+  `~/.qwenpaw/workspaces/<id>/agent.json`, not only in workspace-local
+  `agents/` trees the first cut scanned — so on a real deployment the
+  inventory was empty and both the no-owner stand-down and the draft were
+  dead code. The host tree is probed when the plugin genuinely lives under
+  `~/.qwenpaw/plugins/`; a checkout elsewhere is never guessed at.
+- **The orchestrator and disabled agents are never dispatch targets.**
+  `default` is excluded from the inventory, and the host `config.json`
+  `agents.profiles` enabled flag is honoured (a specialist parked for the
+  day, like this deployment's Qoder, does not receive routes). A broken or
+  missing config.json excludes nothing — fail open.
+- **Drafts follow the environment's own declared policy.** The orchestrator's
+  `agent.json` description states the routing intent in prose ("专利/规格书/
+  Office文档派 IPP，图形/图像/视频/PPT派 Designer…"); the draft parses those
+  "X派Y" claims and routes each deliverable category to the agent the
+  operator already named, dropping claims that point at agents outside the
+  live inventory. The id/skills/description scan remains only as a fallback
+  for deployments without a written policy. On the reference deployment the
+  generated draft now routes documents→IPP, media→Designer, CAD→PCB_Agent
+  with archives unrouted — matching the declared policy exactly.
+
 ## v0.1.3
 
 - **No owner, no block.** A denial is only useful if it names a dispatch

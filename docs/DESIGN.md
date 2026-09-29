@@ -83,6 +83,14 @@ the same inventory the denial logic uses, so `unconfigured` mode now drafts
 artifacts, archives) mapped to the first discovered agent whose
 id/skills/description mentions the category, `mode` pinned to `warn`.
 
+When the orchestrator states its routing policy in its own `agent.json`
+description ("专利/规格书/Office文档派 IPP，…"), that policy outranks any
+guess: each "X派Y" claim maps its slash-separated keywords to the named
+agent, claims naming agents outside the live inventory are dropped, and only
+categories the policy leaves uncovered fall back to the manifest scan. The
+draft is then the deployment's declared intent in machine-checkable form,
+not the plugin's opinion about it.
+
 Two guardrails keep the draft honest. It never writes `routes.json` —
 activation is an explicit rename, so the plugin cannot switch itself into
 enforcement. And the draft is environment-derived data (real agent ids), so it
