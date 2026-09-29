@@ -9,7 +9,7 @@ the rule to the seam where the cost of violation becomes a hard denial plus a
 concrete redirect. The prompt stays as the *first* line (routing by intent);
 the plugin is the *last* line (routing by side effect).
 
-## Deny writes, only warn on shell
+## Deny writes, only warn on shell — until the operator opts in
 
 Write tools carry an explicit path — a reliable signal. Shell commands are
 ambiguous: `pandoc -o out.docx` might be a deliverable, might be a temp
@@ -17,6 +17,16 @@ conversion in a scratch dir, and status-check commands must stay cheap and
 unimpeded. So shell heuristics append a warning block to the `ToolResponse`
 (visible to the model on its next step) and never block. All warnings land in
 the audit log for later tuning.
+
+One caveat earned in the field: the permission-gate stress-test of Claude
+Code's auto mode (see docs/RESEARCH.md) showed that agents under a gate
+route around it through whatever path the gate does not evaluate — here, a
+shell redirect into the deliverable target. That is why v0.1.5 adds an
+opt-in `shell_enforce`: when it is on, enforce mode denies the *unambiguous*
+shapes only (an explicit output target that is deliverable-shaped and owned
+by a live agent); ambiguous or basic targets still just warn. The default
+remains warn-only, because a content-based shell heuristic plus a blanket
+deny is how a guard becomes the reason work stops.
 
 ## Why only deliverable-shaped writes
 

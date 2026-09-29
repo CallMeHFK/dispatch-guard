@@ -163,7 +163,7 @@ agent owns — is never blocked, just recorded as `no_owner` in the audit log:
 | `write_file` / `edit_file` / `append_file` to a **basic** target (whitelisted paths, notes, scripts, configs, scratch, extension-less files — anything not deliverable-shaped) | **Passes untouched**, not even logged | same | same | not attached |
 | `write_file` / `edit_file` / `append_file` to a **deliverable-shaped** target whose owner does not exist here (route names an absent agent, or no discovered agent owns the class) | **Passes untouched**; `no_owner` audit record | same | same | not attached |
 | `write_file` / `edit_file` / `append_file` to a **deliverable-shaped** target outside the whitelist, owned by a **live** agent (under `outputs/`, `projects/`, or carrying a deliverable extension — see [Configuration](#configuration)) | **Denied** — "该产出属于 {agent} 域…请用 `submit_to_agent` 派发给 {agent}" | Passes, warning block appended to the `ToolResponse` | Passes, setup block appended (never denies: there is no table to judge ownership from) | Middleware not attached |
-| `execute_shell_command` naming a deliverable-shaped output file with a live owner (redirects, `tee`, `pandoc -o` into deliverable targets) | Passes, warning block — shell heuristics **never block**, in any mode (status checks must stay cheap) | same | same, with the setup block | not attached |
+| `execute_shell_command` naming a deliverable-shaped output file with a live owner (redirects, `tee`, `pandoc -o` into deliverable targets) | Passes, warning block — shell heuristics **never block** unless `shell_enforce` is on, in which case the unambiguous shapes are denied (status checks must stay cheap) | same | same, with the setup block | not attached |
 | `spawn_subagent` / `spawn_agent` | **Denied** (backstop for the config-layer disable) | denied | denied | not attached |
 
 Mode is re-read from `routes.json` on every tool call and cached by file mtime,
@@ -209,6 +209,12 @@ The sample uses placeholder agent ids; replace them with your own:
                              // (extends the built-in defaults)
   "deliverable_exts": [],    // extra extensions that mark a write as a deliverable
                              // (extends the built-in list, never replaces it)
+  "shell_enforce": false,    // opt-in: in enforce mode, DENY shell commands whose
+                             // explicit output target is a deliverable owned by a
+                             // live agent (closes the shell-redirect bypass; see
+                             // docs/RESEARCH.md → permission-gate coverage gap)
+  "write_tools": [],         // extra write-capable tool names to guard (host tools
+                             // that produce files, e.g. code runners, downloaders)
   "routes": [                // keyword -> owning agent (CJK substring, ASCII word-boundary)
     {"match": ["文档", "报告", "docx", "pdf"], "agent": "DocAgent"},
     {"match": ["代码", "refactor", "debug", "CI"], "agent": "CodeAgent"}
@@ -307,6 +313,17 @@ The suite imports `backend/main.py` with AgentScope/QwenPaw imports degraded to
 local stand-ins, so it runs on a bare Python 3.10+ (CI does exactly that, on
 3.10/3.11/3.12, plus `ruff check .`). Setup, conventions, and the secrets rule
 are in [CONTRIBUTING.md](CONTRIBUTING.md).
+
+To decide the `warn` → `enforce` promotion on evidence, summarize the audit
+trail:
+
+```bash
+python packaging/audit_summary.py <workspace>/logs/dispatch_guard.jsonl
+```
+
+The design is grounded in recent literature on LLM-agent guardrails and
+orchestration failures — [docs/RESEARCH.md](docs/RESEARCH.md) maps each paper
+to the decision it informs.
 
 Cutting a release: bump `version` in `plugin.json` and add a `## vX.Y.Z`
 section at the top of `docs/CHANGELOG.md` — pushing that to `main` is the whole

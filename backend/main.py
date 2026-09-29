@@ -187,10 +187,88 @@ def _load_config() -> dict[str, Any]:
         try:
             _CONFIG_CACHE["data"] = json.loads(path.read_text(encoding="utf-8"))
             _CONFIG_CACHE["mtime"] = mtime
+            _lint_policy(_CONFIG_CACHE["data"])
         except Exception:  # noqa: BLE001 - fail open
             logger.exception("dispatch-guard: bad routes.json, failing open")
             return {"mode": "off", "routes": [], "ext_routes": {}}
     return _CONFIG_CACHE["data"]
+
+
+def _lint_policy(cfg: dict[str, Any]) -> None:
+    """Static checks on the dispatch table, in the spirit of policy-compiler
+    work on agentic systems (contradiction / redundancy / dead-rule analyses):
+    a table that cannot mean what its author wrote should say so in the host
+    log at load time, not surprise them at interception time. Lint never
+    changes behaviour — the runtime rules stay exactly as written.
+    """
+    mode = cfg.get("mode")
+    if mode is not None and mode not in ("enforce", "warn", "off", UNCONFIGURED):
+        logger.warning(
+            "dispatch-guard lint: mode %r is not enforce|warn|off; it will be "
+            "treated as warn",
+            mode,
+        )
+    seen: dict[str, tuple[str, int]] = {}
+    for index, rule in enumerate(cfg.get("routes") or []):
+        if not isinstance(rule, dict):
+            continue
+        agent = str(rule.get("agent", ""))
+        for keyword in rule.get("match") or []:
+            key = str(keyword).lower()
+            previous = seen.get(key)
+            if previous is not None and previous[0] != agent:
+                logger.warning(
+                    "dispatch-guard lint: keyword %r is routed to both %s (rule %d) "
+                    "and %s (rule %d); the earlier rule wins",
+                    keyword,
+                    previous[0],
+                    previous[1],
+                    agent,
+                    index,
+                )
+            seen[key] = (agent, index)
+    deliverable_exts = _deliverable_exts(cfg)
+    for ext, agent in (cfg.get("ext_routes") or {}).items():
+        normalized = str(ext).lower()
+        if not normalized.startswith("."):
+            normalized = f".{normalized}"
+        if normalized not in deliverable_exts:
+            logger.warning(
+                "dispatch-guard lint: ext_routes entry %s -> %s can never fire: "
+                "%s is not a deliverable extension (see deliverable_exts); writes "
+                "with it pass as basic operations",
+                ext,
+                agent,
+                ext,
+            )
+
+
+def _write_tools(cfg: dict[str, Any]) -> frozenset[str]:
+    """Write-capable tool names: the built-ins plus operator extensions.
+
+    Permission-gate evaluations of deployed coding agents found the dominant
+    enforcement gap is coverage: agents achieve a blocked effect through a
+    tool path the gate does not evaluate. Hosts grow host-specific
+    file-producing tools (code runners that save artifacts, downloaders), so
+    routes.json ``write_tools`` extends the built-in set instead of leaving
+    those paths unguarded by construction.
+    """
+    tools = set(WRITE_TOOLS)
+    custom = cfg.get("write_tools")
+    if isinstance(custom, list):
+        tools.update(str(name) for name in custom if str(name).strip())
+    return frozenset(tools)
+
+
+def _shell_enforce(cfg: dict[str, Any]) -> bool:
+    """Whether enforce mode may deny shell commands that produce deliverables.
+
+    Default off: shell heuristics are content-based, and a blanket shell deny
+    wedges legitimate work. When on, only the unambiguous shapes are denied —
+    an explicit output target (redirect/tee/-o) that is deliverable-shaped
+    AND owned by a live agent; everything else still warns.
+    """
+    return cfg.get("shell_enforce") is True
 
 
 def _deliverable_dirs(cfg: dict[str, Any]) -> tuple[str, ...]:
@@ -680,7 +758,7 @@ class DispatchGuardMiddleware(MiddlewareBase):
             )
             return
 
-        if name in WRITE_TOOLS:
+        if name in _write_tools(cfg):
             rel = self._rel(target)
             # Whitelisted bookkeeping writes and every non-deliverable write
             # (notes, scripts, configs, scratch, extension-less files) are
@@ -773,6 +851,20 @@ class DispatchGuardMiddleware(MiddlewareBase):
                         yield event
                     return
                 hint = owner or "对应专业 agent"
+                if mode == "enforce" and _shell_enforce(cfg):
+                    # Opt-in (routes.json "shell_enforce": true): close the
+                    # documented bypass where an agent under enforce produces
+                    # the deliverable through a shell redirect instead of
+                    # write_file. Only the unambiguous shapes reach this path
+                    # (explicit output target, deliverable-shaped, live owner).
+                    yield self._deny(
+                        f"该产出属于 {hint} 域（shell 生成/覆盖交付物：{why or '交付物路径'}），"
+                        f"请改用 submit_to_agent 派发给 {hint}。目标：{hit}",
+                        name,
+                        hit[:120],
+                        mode,
+                    )
+                    return
                 async for event in self._warn_and_pass(
                     f"[dispatch-guard warn] 命令疑似生成或覆盖交付物（{hit[:80]}），"
                     f"命中 {hint}（{why or '交付物路径'}）；enforce 模式下写交付物将被拒绝，"
