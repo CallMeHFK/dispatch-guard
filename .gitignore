@@ -1,7 +1,9 @@
 # Private dispatch table — never commit. The repo ships routes.example.json only;
 # your real table belongs in the installed plugin directory
-# (~/.qwenpaw/plugins/dispatch-guard/routes.json).
+# (~/.qwenpaw/plugins/dispatch-guard/routes.json). The environment-derived draft
+# (routes.draft.json) names your real agents and is private the same way.
 routes.json
+routes.draft.json
 
 # Python
 __pycache__/
