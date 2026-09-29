@@ -29,15 +29,25 @@ RECORDS = [
     },
     {"ts": 5, "action": "no_owner", "mode": "enforce", "target": "outputs/poster.svg"},
     {"ts": 6, "action": "no_owner", "mode": "enforce", "target": "outputs/bundle.zip"},
+    # spawn backstop denial names no dispatch agent; it must not pollute the
+    # per-agent attribution.
+    {
+        "ts": 7,
+        "action": "denied",
+        "mode": "enforce",
+        "target": '{"task": "blind review"}',
+        "message": "spawn_subagent 已停用（配置层禁用）。盲评或并行 worker 请用 "
+        "chat_with_agent / submit_to_agent 派给专业 agent。",
+    },
 ]
 
 
 class AuditSummaryTest(unittest.TestCase):
     def test_counts_and_attributions(self):
         s = audit_summary.summarize(RECORDS)
-        self.assertEqual(s["events"], 6)
-        self.assertEqual(s["actions"], {"needs_config": 1, "warned": 1, "denied": 2, "no_owner": 2})
-        self.assertEqual(s["modes"], {"unconfigured": 1, "warn": 1, "enforce": 4})
+        self.assertEqual(s["events"], 7)
+        self.assertEqual(s["actions"], {"needs_config": 1, "warned": 1, "denied": 3, "no_owner": 2})
+        self.assertEqual(s["modes"], {"unconfigured": 1, "warn": 1, "enforce": 5})
         self.assertEqual(s["denied_by_agent"], {"DocAgent": 2})
 
     def test_no_owner_targets_are_reported(self):
