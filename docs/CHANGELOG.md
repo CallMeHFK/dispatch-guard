@@ -1,5 +1,22 @@
 # Changelog
 
+## v0.1.1
+
+- Plugin-tree whitelist entries now match **absolute paths only**. Previously a
+  workspace-relative target could resolve (against cwd) into the plugin parent
+  directory and be silently whitelisted (e.g. when the dev repo sits under
+  `PLUGIN_DIR.parent`).
+- Production verification record (2026-09-29, enforce mode):
+  - 10-case false-positive matrix clean: whitelist/plugin-tree/trash writes
+    pass silently; `outputs/`+`projects/` writes denied with dispatch hints;
+    ASCII word boundaries hold; read-only or mention-only shell commands never warn.
+  - E2E: in-domain dispatch 3/5 (self-write first denied, then routed),
+    micro/QA cases 0 dispatches, 0 `spawn_subagent` calls, 0 unsafe self-actions
+    (warn baseline had root-dir self-writes and 172 browser touches on one case).
+  - Known warn-only trade-off documented: shell heuristic is content-based, so
+    bookkeeping heredocs that *mention* a deliverable extension emit a
+    non-blocking warning (logged, never denied).
+
 ## v0.1.0
 
 - Initial release: `on_acting` middleware that enforces an orchestrator agent's
