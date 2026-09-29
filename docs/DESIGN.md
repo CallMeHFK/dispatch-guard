@@ -18,6 +18,77 @@ unimpeded. So shell heuristics append a warning block to the `ToolResponse`
 (visible to the model on its next step) and never block. All warnings land in
 the audit log for later tuning.
 
+## Why only deliverable-shaped writes
+
+The first version treated every write outside the whitelist as a deliverable.
+That made `enforce` a blanket blocker: a root `notes.md`, a `scripts/setup.py`,
+a `Makefile` — ordinary file operations — were denied and routed to a
+"specialist" that has no business receiving them. A guard that denies the
+basics trains its operator to disable the guard.
+
+So the deny set is now exactly *deliverable-shaped* targets: under a
+deliverable directory (`outputs/`, `projects/` by default, configurable) or
+carrying a deliverable extension (`.docx`, `.pdf`, `.zip`, `.png`, CAD
+artifacts, … — configurable, extending the built-in list). Everything else is
+a basic operation that passes untouched in every mode, without a log entry.
+Code and text formats are deliberately not deliverables: the orchestrator
+writing a script or a config file is doing its job, not producing output that
+belongs to a specialist. Reads are outside the mandate entirely — the guard
+governs who *produces* outputs, never who may look at them.
+
+The whitelist still wins over deliverable shape (`tmp/render.png` passes), and
+the shell heuristic now shares the same predicate, so a redirect into a notes
+file no longer earns a warning while `pandoc -o outputs/r.docx` still does.
+The trade-off is deliberate: a deliverable saved to an unexpected location
+(e.g. `reports/q3.pdf` at the workspace root) now passes instead of being
+denied. That is the cost of never blocking basic operations; `deliverable_exts`
+and `deliverable_dirs` exist to close exactly that gap per deployment.
+
+## No owner, no block
+
+A denial is only useful if it names a dispatch target that exists. The first
+design trusted `routes.json` blindly, so a table that drifted from reality —
+an agent renamed, a specialist removed, a category nobody covers — kept
+denying writes and pointing at agents that were not there. The deliverable had
+nowhere to go: the guard had become a wall, not a router.
+
+The guard therefore discovers the environment's specialists before it blocks
+anything: `agents/*/agent.json` manifests in the workspace plus the host-level
+agents directory (when the plugin really lives in a QwenPaw tree). Every route
+is validated against that inventory at interception time, and the rule is
+absolute: **a block must name a real dispatch target.** A route naming an
+absent agent, or a deliverable class no discovered agent owns, passes —
+recorded as `no_owner` in the audit log, silent to the model (a warning that
+names no one is noise), audible to the operator.
+
+One deliberate asymmetry: discovery finding *zero* agents does not disarm the
+guard. An empty inventory means "we could not read this deployment", not
+"this deployment has no specialists" — the operator's table is then trusted
+verbatim, preserving the pre-discovery behaviour. Only a *non-empty*
+inventory gets veto power.
+
+The natural follow-up — "then why does my `.docx` write pass when there is no
+doc agent?" — is the point: the plugin's contract is routing, not prohibition.
+Blocking a write you cannot route is just breaking the agent's work with
+extra steps. Install or designate a specialist for the class and the same
+write starts being enforced.
+
+## Draft, don't interrogate
+
+The original unconfigured flow asked the agent to interview the user and
+hand-write a dispatch table — accurate, but slow, and every fresh install
+started from a blank file the plugin could have filled in. The plugin can see
+the same inventory the denial logic uses, so `unconfigured` mode now drafts
+`routes.draft.json` itself: deliverable categories (documents, media, hardware
+artifacts, archives) mapped to the first discovered agent whose
+id/skills/description mentions the category, `mode` pinned to `warn`.
+
+Two guardrails keep the draft honest. It never writes `routes.json` —
+activation is an explicit rename, so the plugin cannot switch itself into
+enforcement. And the draft is environment-derived data (real agent ids), so it
+is gitignored and the packaging step refuses to ship it, exactly like a
+hand-written table.
+
 ## Why the whitelist includes the plugin tree
 
 First live contact produced the bootstrap paradox: the guard denied its own
