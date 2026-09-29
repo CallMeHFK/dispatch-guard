@@ -221,14 +221,22 @@ def _deliverable_exts(cfg: dict[str, Any]) -> frozenset[str]:
 # Environment discovery: which specialist agents actually exist here?
 #
 # A denial that routes a deliverable to an agent which is not installed just
-# strands the write — there is nowhere to dispatch to. Manifests are read from
-# the workspace (``agents/*/agent.json`` and a top-level ``agent.json``) and,
-# when the plugin really lives inside a QwenPaw tree, the host-level agents
-# directory beside ``plugins/``.
+# strands the write — there is nowhere to dispatch to. Two layouts are probed:
+# workspace-local ``agents/*/agent.json`` trees, and the real QwenPaw host
+# layout (one workspace per agent, manifest at ``~/.qwenpaw/workspaces/<id>/
+# agent.json``) when the plugin genuinely lives inside ``~/.qwenpaw/plugins/``.
+# The host's ``config.json`` ``agents.profiles`` carries the authoritative
+# enabled flag; explicitly disabled agents (e.g. a specialist parked for the
+# day) are excluded from the inventory, and so is ``default`` — the
+# orchestrator is never its own dispatch target.
 
 _AGENTS_CACHE: dict[str, Any] = {"ws": None, "agents": None, "ids": frozenset()}
 _DRAFT_WRITTEN = False
 _NO_OWNER_LOGGED = False
+
+_POLICY_SEGMENT = re.compile(r"[，,；;\n]")
+_POLICY_CLAIM = re.compile(r"(.+?)派\s*([A-Za-z_][A-Za-z0-9_-]*)")
+_POLICY_TOKEN = re.compile(r"[/、]")
 
 # Category presets used to draft a dispatch table from discovered agents:
 # each group's extensions route to the first agent whose id / skills /
@@ -274,18 +282,57 @@ def _parse_agent_manifest(path: Path) -> dict[str, Any] | None:
     }
 
 
+def _host_tree() -> Path | None:
+    """QwenPaw's home directory, or None outside a host plugin install.
+
+    Real installs sit at ``~/.qwenpaw/plugins/<id>``; the checkout used for
+    development does not, and must never have its parent directories guessed
+    at. Everything host-level (workspaces/, config.json) hangs off this root.
+    """
+    if PLUGIN_DIR.parent.name == "plugins":
+        return PLUGIN_DIR.parent.parent
+    return None
+
+
+def _disabled_agent_ids() -> frozenset[str]:
+    """Agent ids the host has explicitly disabled (config.json profiles).
+
+    Reading the host config is best-effort: an unreadable or absent file
+    means no exclusions, never a smaller inventory — a missing enable-flag
+    must not invent a "no owner" verdict.
+    """
+    host = _host_tree()
+    if host is None:
+        return frozenset()
+    try:
+        cfg = json.loads((host / "config.json").read_text(encoding="utf-8"))
+        profiles = cfg.get("agents", {}).get("profiles", {})
+        return frozenset(
+            str(aid)
+            for aid, profile in profiles.items()
+            if isinstance(profile, dict) and profile.get("enabled") is False
+        )
+    except (OSError, ValueError):
+        return frozenset()
+
+
 def _discovery_roots(ws: Path) -> list[Path]:
     roots = [ws / "agents", ws / ".qwenpaw" / "agents"]
-    # Host-level agents dir only when the plugin genuinely lives in a QwenPaw
-    # tree (~/.qwenpaw/plugins/<id>); a checkout anywhere else must not have
-    # its parent directories guessed at.
-    if PLUGIN_DIR.parent.name == "plugins":
-        roots.append(PLUGIN_DIR.parent.parent / "agents")
+    host = _host_tree()
+    if host is not None:
+        # Real QwenPaw layout: one workspace per agent with its manifest at
+        # workspaces/<id>/agent.json; the legacy host agents dir is probed too.
+        roots.append(host / "workspaces")
+        roots.append(host / "agents")
     return roots
 
 
 def _discover_agents(ws: str | Path) -> list[dict[str, Any]]:
-    """Agents installed in this environment, cached per workspace."""
+    """Agents installed in this environment, cached per workspace.
+
+    ``default`` (the orchestrator this middleware attaches to) and explicitly
+    disabled agents are never dispatch targets and are left out.
+    """
     ws_path = Path(ws)
     if _AGENTS_CACHE["ws"] == str(ws_path) and _AGENTS_CACHE["agents"] is not None:
         return _AGENTS_CACHE["agents"]
@@ -301,30 +348,86 @@ def _discover_agents(ws: str | Path) -> list[dict[str, Any]]:
                     found[parsed["id"]] = parsed
     except OSError:
         logger.exception("dispatch-guard: agent discovery failed")
-    agents = list(found.values())
+    excluded = _disabled_agent_ids() | {"default"}
+    agents = [
+        found[aid]
+        for aid in sorted(found)
+        if aid not in excluded
+    ]
     _AGENTS_CACHE.update(
-        {"ws": str(ws_path), "agents": agents, "ids": frozenset(found)}
+        {"ws": str(ws_path), "agents": agents, "ids": frozenset(a["id"] for a in agents)}
     )
     return agents
 
 
+def _dispatch_policy(ws: str | Path, agents: list[dict[str, Any]]) -> list[tuple[str, str]]:
+    """(keyword token -> agent id) parsed from the orchestrator's own words.
+
+    Deployments state their routing intent in the default agent.json
+    description ("专利/交底书/Office文档派 IPP，代码/仿真/CI派 Codex_Agent…").
+    Each "X派Y" claim yields one token per slash-separated term on the left;
+    segment order is declaration order, so earlier claims outrank later ones.
+    Claims naming an agent that is not in the live inventory are dropped —
+    a policy pointing at a disabled or removed specialist is not a route.
+    """
+    try:
+        manifest = json.loads((Path(ws) / "agent.json").read_text(encoding="utf-8"))
+        description = str(manifest.get("description") or "")
+    except (OSError, ValueError):
+        return []
+    known = {agent["id"] for agent in agents}
+    policy: list[tuple[str, str]] = []
+    for segment in _POLICY_SEGMENT.split(description):
+        claim = _POLICY_CLAIM.search(segment)
+        if not claim or claim.group(2) not in known:
+            continue
+        for token in _POLICY_TOKEN.split(claim.group(1)):
+            token = token.strip()
+            if token:
+                policy.append((token, claim.group(2)))
+    return policy
+
+
 def _draft_route_table(ws: str | Path) -> dict[str, Any] | None:
-    """Map discovered agents onto deliverable categories, or None if vacuous."""
+    """Map discovered agents onto deliverable categories, or None if vacuous.
+
+    Routing follows the environment's own declared intent first: the
+    orchestrator's "X派Y" policy (parsed from its agent.json description)
+    decides each category. Only when no policy is parseable does the draft
+    fall back to guessing from agent ids/skills/descriptions — a terse
+    manifest scan invents ownership that the deployment never stated.
+    """
     agents = _discover_agents(ws)
     if not agents:
         return None
     cfg: dict[str, Any] = {"mode": "warn", "routes": [], "ext_routes": {}}
+    policy = _dispatch_policy(ws, agents)
+    routed = False
     for preset in _DRAFT_PRESETS:
         owner = None
-        for agent in agents:
-            blob = " ".join([agent["id"], *agent["skills"], agent["description"]]).lower()
-            if any(term.lower() in blob for term in preset["match"]):
-                owner = agent["id"]
-                break
+        if policy:
+            lowered = [(token.lower(), agent_id) for token, agent_id in policy]
+            for term in preset["match"]:
+                term = term.lower()
+                for token, agent_id in lowered:
+                    if term in token or token in term:
+                        owner = agent_id
+                        break
+                if owner:
+                    break
+        else:
+            for agent in agents:
+                blob = " ".join(
+                    [agent["id"], *agent["skills"], agent["description"]]
+                ).lower()
+                if any(t.lower() in blob for t in preset["match"]):
+                    owner = agent["id"]
+                    break
         if owner:
             cfg["ext_routes"].update({ext: owner for ext in preset["exts"]})
             cfg["routes"].append({"match": list(preset["match"]), "agent": owner})
-    return cfg if cfg["ext_routes"] else None
+            routed = True
+    return cfg if routed else None
 
 
 def _maybe_write_draft(ws: str | Path) -> Path | None:
