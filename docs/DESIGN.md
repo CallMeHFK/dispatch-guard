@@ -38,14 +38,25 @@ JSON-looking strings first; `memory/2026-09-28.md` is seen as a path again.
 
 ## Keyword matching
 
-Routing hints exist to make denials actionable ("派发给 IPP", not "denied").
+Routing hints exist to make denials actionable ("派发给 DocAgent", not "denied").
 CJK terms match as substrings (Chinese has no word boundaries); pure-ASCII
 terms require word boundaries so `CI` does not fire inside `asyncio` and `cad`
 does not fire inside `decade`. Extension routing is checked before keywords
 because file extensions are the least ambiguous signal.
 
-## Fail-open everywhere
+## Fail-open, with one visible exception
 
-A bad `routes.json`, a missing config, a logging failure — all degrade to
-"no interception" rather than a wedged agent. The guard is an enforcement
+A malformed `routes.json`, a logging failure, an unreadable config — all degrade
+to "no interception" rather than a wedged agent. The guard is an enforcement
 convenience, not a security boundary; it must never be the reason work stops.
+Denying everything because the table could not be parsed would also invent
+ownership claims from an unread source.
+
+A **missing** `routes.json` is not a failure, it is a fresh install, and it is
+the one case that does not go silent. The repository ships only
+`routes.example.json`, so "no table yet" is the default state every new user
+starts in; detaching there would report a healthy plugin that enforces nothing,
+and the operator would only learn the truth the day a deliverable lands in the
+wrong agent's hands. So `unconfigured` mode stays attached, never denies, appends
+a block telling the agent to build the table with the user, logs one host-side
+warning per process, and records `needs_config` in the audit trail.

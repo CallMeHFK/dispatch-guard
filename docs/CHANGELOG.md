@@ -1,5 +1,23 @@
 # Changelog
 
+## v0.1.2
+
+- **The repository no longer ships a dispatch table.** `routes.json` is private
+  operator data (agent ids, internal system names, deployment shape) and is now
+  gitignored; the repo carries `routes.example.json` with placeholder agent ids
+  only. `build_plugin_zip.py` refuses to build if a real table is present.
+- **New `unconfigured` mode** for installs with no `routes.json`: the middleware
+  attaches, never denies, appends a block telling the agent to build the table
+  with the user, logs one host-side warning per process, and records
+  `needs_config` in the audit trail. Previously this state detached silently —
+  a fresh install reported success while enforcing nothing.
+- Audit records now carry the mode actually in effect for that call instead of
+  the mode snapshotted when the middleware attached.
+- Denial text no longer names an individual approver; it says "confirm with the
+  user".
+- Docs: first-run configuration added to the README; `docs/DESIGN.md` splits
+  "missing config" (onboarding, visible) from "unreadable config" (fail open).
+
 ## v0.1.1
 
 - Plugin-tree whitelist entries now match **absolute paths only**. Previously a

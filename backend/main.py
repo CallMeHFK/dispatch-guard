@@ -11,6 +11,12 @@ Three behaviours, gated by ``routes.json`` ``mode`` (enforce | warn | off):
   avoid false positives on status-check commands.
 * ``spawn_subagent`` -> DENIED as a backstop for the config-layer disable.
 
+A freshly installed plugin has no ``routes.json`` at all (the repository ships
+only ``routes.example.json``). That state is ``unconfigured``, not ``off``: the
+middleware attaches, never denies a write, and appends a block telling the
+agent to build the dispatch table together with the user. Detaching instead
+would report a healthy install that enforces nothing.
+
 Whitelist = orchestration/meta paths only: memory/, notes/, wiki/, episodes/,
 tmp/, trash/, logs/ plus the top-level MD baselines and skill.json/agent.json.
 Every interception is appended to ``<workspace>/logs/dispatch_guard.jsonl``.
@@ -103,6 +109,33 @@ SHELL_WARN_PATTERNS = (
 )
 
 _CONFIG_CACHE: dict[str, Any] = {"mtime": 0.0, "data": None}
+_UNCONFIGURED_LOGGED = False
+
+UNCONFIGURED = "unconfigured"
+SETUP_HINT = (
+    "[dispatch-guard 未配置] 插件目录下没有 routes.json，派发表为空，"
+    "当前只提示不拦截。请和用户一起确认各类产出归属哪个 agent，"
+    "把结论写成 routes.json（可从 routes.example.json 复制起步）："
+    "mode 先设 warn 观察一轮拦截日志，确认派发表无误后再切 enforce。"
+    "目标：{target}"
+)
+
+
+def _warn_unconfigured() -> None:
+    """Announce the unconfigured state once per process.
+
+    ``on_acting`` re-reads the config on every tool call, so logging there
+    would flood the host log for an install the user has not configured yet.
+    """
+    global _UNCONFIGURED_LOGGED
+    if _UNCONFIGURED_LOGGED:
+        return
+    _UNCONFIGURED_LOGGED = True
+    logger.warning(
+        "dispatch-guard: no routes.json in %s — attached in unconfigured mode, "
+        "deliverable writes are warned but not denied until a dispatch table exists.",
+        PLUGIN_DIR,
+    )
 
 
 def _load_config() -> dict[str, Any]:
@@ -111,7 +144,8 @@ def _load_config() -> dict[str, Any]:
     try:
         mtime = path.stat().st_mtime
     except OSError:
-        return {"mode": "off", "routes": [], "ext_routes": {}}
+        _warn_unconfigured()
+        return {"mode": UNCONFIGURED, "routes": [], "ext_routes": {}}
     if _CONFIG_CACHE["data"] is None or mtime != _CONFIG_CACHE["mtime"]:
         try:
             _CONFIG_CACHE["data"] = json.loads(path.read_text(encoding="utf-8"))
@@ -199,13 +233,13 @@ class DispatchGuardMiddleware(MiddlewareBase):
                     return rule.get("agent"), f"kw {kw}"
         return None, None
 
-    def _deny(self, text: str, tool_name: str, target: str) -> ToolResponse:
+    def _deny(self, text: str, tool_name: str, target: str, mode: str) -> ToolResponse:
         self._log(
             {
                 "action": "denied",
                 "tool": tool_name,
                 "target": target,
-                "mode": self._mode,
+                "mode": mode,
                 "message": text,
             }
         )
@@ -219,14 +253,16 @@ class DispatchGuardMiddleware(MiddlewareBase):
         warn: str,
         tool_name: str,
         target: str,
+        mode: str,
         next_handler: Callable[..., AsyncGenerator[Any, None]],
+        action: str = "warned",
     ) -> AsyncGenerator[Any, None]:
         self._log(
             {
-                "action": "warned",
+                "action": action,
                 "tool": tool_name,
                 "target": target,
-                "mode": self._mode,
+                "mode": mode,
                 "message": warn,
             }
         )
@@ -260,21 +296,34 @@ class DispatchGuardMiddleware(MiddlewareBase):
                 "chat_with_agent / submit_to_agent 派给专业 agent。",
                 name,
                 target,
+                mode,
             )
             return
 
         if name in WRITE_TOOLS:
             rel = self._rel(target)
             if not self._whitelisted(rel):
+                if mode == UNCONFIGURED:
+                    async for event in self._warn_and_pass(
+                        SETUP_HINT.format(target=rel),
+                        name,
+                        rel,
+                        mode,
+                        next_handler,
+                        action="needs_config",
+                    ):
+                        yield event
+                    return
                 agent_id, why = self._route_hit(rel)
                 hint = agent_id or "对应专业 agent"
                 if mode == "enforce":
                     yield self._deny(
                         f"该产出属于 {hint} 域（命中 {why or '白名单外路径'}），"
                         f"请用 submit_to_agent 派发给 {hint}；"
-                        f"如确属编排/元操作，先经 Han 确认加白名单。目标：{rel}",
+                        f"如确属编排/元操作，请与用户确认后加入白名单。目标：{rel}",
                         name,
                         rel,
+                        mode,
                     )
                     return
                 async for event in self._warn_and_pass(
@@ -282,6 +331,7 @@ class DispatchGuardMiddleware(MiddlewareBase):
                     f"enforce 模式下将被拒绝并提示派发。",
                     name,
                     rel,
+                    mode,
                     next_handler,
                 ):
                     yield event
@@ -298,6 +348,17 @@ class DispatchGuardMiddleware(MiddlewareBase):
                 cmd = str(raw_input)
             hit = next((m.group(0) for p in SHELL_WARN_PATTERNS if (m := p.search(cmd))), None)
             if hit:
+                if mode == UNCONFIGURED:
+                    async for event in self._warn_and_pass(
+                        SETUP_HINT.format(target=hit[:120]),
+                        name,
+                        hit[:120],
+                        mode,
+                        next_handler,
+                        action="needs_config",
+                    ):
+                        yield event
+                    return
                 agent_id, why = self._route_hit(hit)
                 hint = agent_id or "对应专业 agent"
                 async for event in self._warn_and_pass(
@@ -306,6 +367,7 @@ class DispatchGuardMiddleware(MiddlewareBase):
                     f"请改用 submit_to_agent 派发。",
                     name,
                     hit[:120],
+                    mode,
                     next_handler,
                 ):
                     yield event
@@ -319,12 +381,13 @@ def _factory(ctx: Any, agent_config: Any) -> DispatchGuardMiddleware | None:
     agent_id = getattr(agent_config, "id", None) or getattr(ctx, "agent_id", None)
     if agent_id != "default":
         return None
-    if _load_config().get("mode", "enforce") == "off":
+    mode = _load_config().get("mode", "enforce")
+    if mode == "off":
         return None
     workspace_dir = getattr(ctx, "workspace_dir", None)
     if not workspace_dir:
         return None
-    return DispatchGuardMiddleware(workspace_dir, _load_config().get("mode", "enforce"))
+    return DispatchGuardMiddleware(workspace_dir, mode)
 
 
 class DispatchGuardPlugin:
