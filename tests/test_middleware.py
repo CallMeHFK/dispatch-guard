@@ -397,6 +397,110 @@ class DispatchGuardTest(unittest.TestCase):
         r = run(mw, "write_file", {"file_path": "outputs/x.docx"})
         self.assertIn("routes.example.json", r[0].content[1].text)
 
+    # -- real QwenPaw host layout -------------------------------------------
+    # The host keeps one workspace per agent (workspaces/<id>/agent.json) and
+    # the authoritative enabled flags in config.json agents.profiles. The
+    # orchestrator itself and explicitly disabled agents are never targets.
+
+    def _make_host_tree(self, agents_spec, profiles):
+        """<tmp>/host/plugins/dispatch-guard + <tmp>/host/{workspaces,config.json}.
+
+        Redirects dg.PLUGIN_DIR into host/plugins/ so the host-probing gate
+        (_host_tree: parent.name == "plugins") actually fires, mirroring
+        ~/.qwenpaw/plugins/dispatch-guard. The extra "host" level is what
+        makes parent.parent resolve to the fake QwenPaw home.
+        """
+        host = Path(self.plugin_tmp.name) / "host"
+        dg.PLUGIN_DIR = host / "plugins" / "dispatch-guard"
+        dg.PLUGIN_DIR.mkdir(parents=True, exist_ok=True)
+        for aid, desc in agents_spec.items():
+            d = host / "workspaces" / aid
+            d.mkdir(parents=True, exist_ok=True)
+            (d / "agent.json").write_text(
+                json.dumps({"id": aid, "description": desc}, ensure_ascii=False),
+                encoding="utf-8",
+            )
+        (host / "config.json").write_text(
+            json.dumps({"agents": {"profiles": profiles}}, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        return host
+
+    def test_host_workspace_layout_is_discovered(self):
+        host = self._make_host_tree(
+            {"IPP": "验收报告", "Designer": "图形", "default": "编排者"},
+            {"IPP": {"enabled": True}, "Designer": {"enabled": True}, "Qoder": {"enabled": False}},
+        )
+        (host / "workspaces" / "Qoder").mkdir()
+        (host / "workspaces" / "Qoder" / "agent.json").write_text(
+            json.dumps({"id": "Qoder", "description": "编码"}, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        self._bust_config_cache()
+        ids = {a["id"] for a in dg._discover_agents(self.ws)}
+        self.assertIn("IPP", ids)
+        self.assertIn("Designer", ids)
+        self.assertNotIn("default", ids, "the orchestrator is never a dispatch target")
+        self.assertNotIn("Qoder", ids, "explicitly disabled agents are not dispatch targets")
+
+    def test_unreadable_host_config_excludes_nothing(self):
+        # Fail open: a broken config.json must not shrink the inventory and
+        # thereby invent no_owner verdicts for live agents.
+        host = Path(self.plugin_tmp.name) / "host"
+        dg.PLUGIN_DIR = host / "plugins" / "dispatch-guard"
+        dg.PLUGIN_DIR.mkdir(parents=True, exist_ok=True)
+        (host / "workspaces" / "IPP").mkdir(parents=True)
+        (host / "workspaces" / "IPP" / "agent.json").write_text(
+            json.dumps({"id": "IPP"}, ensure_ascii=False), encoding="utf-8"
+        )
+        (host / "config.json").write_text("{ not json", encoding="utf-8")
+        self._bust_config_cache()
+        self.assertEqual({a["id"] for a in dg._discover_agents(self.ws)}, {"IPP"})
+
+    # -- draft follows the orchestrator's own dispatch policy ----------------
+
+    def _write_default_manifest(self, description):
+        (Path(self.ws) / "agent.json").write_text(
+            json.dumps({"id": "default", "description": description}, ensure_ascii=False),
+            encoding="utf-8",
+        )
+
+    def test_draft_parses_dispatch_policy_from_default_manifest(self):
+        # The real deployment states routing in default's description:
+        # "专利/规格书/Office文档派 IPP，图形/图像/视频/PPT派 Designer，…"
+        self._make_agents({"IPP": ["专利"], "Designer": ["图形"], "CodeAgent": ["代码"]})
+        self._write_default_manifest(
+            "编排者：分解任务、派发与验收汇总；专利/规格书/Office文档派 IPP，"
+            "图形/图像/视频/PPT派 Designer，代码/仿真/CI派 CodeAgent；"
+            "Qoder 仅 Han 点名时派；自身不直接执行专业工作"
+        )
+        cfg = dg._draft_route_table(self.ws)
+        self.assertIsNotNone(cfg)
+        self.assertEqual(cfg["mode"], "warn")
+        self.assertEqual(cfg["ext_routes"][".docx"], "IPP")
+        self.assertEqual(cfg["ext_routes"][".png"], "Designer")
+        self.assertNotIn(".dxf", cfg["ext_routes"], "no hardware claim in the policy")
+        self.assertNotIn(".py", cfg["ext_routes"], "code stays a basic operation")
+        agents = {route["agent"] for route in cfg["routes"]}
+        self.assertEqual(agents, {"IPP", "Designer"})
+
+    def test_policy_claim_to_absent_agent_is_dropped(self):
+        # "Office文档派 DocAgent" with no DocAgent installed must not route
+        # documents anywhere — a policy pointing at a ghost is not a route.
+        # '归档打包派 CodeAgent' matches no archive preset term either, so the
+        # whole draft is vacuous.
+        self._make_agents({"CodeAgent": ["代码"]})
+        self._write_default_manifest("编排者；Office文档派 DocAgent，归档打包派 CodeAgent")
+        self.assertIsNone(dg._draft_route_table(self.ws))
+
+    def test_no_policy_falls_back_to_manifest_scan(self):
+        # Without a dispatch policy in default's description, the draft still
+        # guesses from the specialists' own ids/skills/descriptions.
+        self._make_agents({"DocAgent": ["文档", "报告"]})
+        cfg = dg._draft_route_table(self.ws)
+        self.assertIsNotNone(cfg)
+        self.assertEqual(cfg["ext_routes"][".docx"], "DocAgent")
+
 
 if __name__ == "__main__":
     unittest.main()
