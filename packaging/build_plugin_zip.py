@@ -14,6 +14,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import subprocess
 import sys
 import zipfile
 from pathlib import Path, PurePosixPath
@@ -31,7 +32,18 @@ EXCLUDE = {
     "tests",
     ".gitignore",
     ".DS_Store",
+    "ruff.toml",
+    ".ruff_cache",
+    ".mypy_cache",
+    ".pytest_cache",
+    ".venv",
+    "logs",
 }
+# The user's real dispatch table is private data: agent names, internal system
+# keywords, and the shape of their whole deployment. EXCLUDE filters directory
+# names only, so a root-level routes.json slips through unless checked for.
+# routes.example.json — the sanitized table shipped in the repo — is allowed.
+PRIVATE_PAYLOAD = {"routes.json"}
 # Fixed timestamp: a rebuild of the same commit must byte-compare equal, so a re-run
 # after a failed release job can be diffed against the asset already on GitHub.
 MEMBER_DATE = (1980, 1, 1, 0, 0, 0)
@@ -39,21 +51,68 @@ MEMBER_MODE = 0o644 << 16
 
 
 def collect(root: Path) -> list[Path]:
+    """Files to publish. A release archive should equal the committed tree.
+
+    Two filters stack: the tracked set decides what exists (walking the directory
+    instead shipped .gitignore's job — a real ``.ruff_cache/`` landed that way),
+    and EXCLUDE decides what is dev-only payload that must not sit in an
+    installed plugin.
+    """
+    tracked = _git_tracked(root)
+    candidates = tracked if tracked is not None else _walk(root)
+    return [p for p in candidates if not _dev_only(p.relative_to(root))]
+
+
+def _dev_only(rel: Path) -> bool:
+    return (
+        any(part in EXCLUDE for part in rel.parts)
+        or rel.name == "__pycache__"
+        or rel.suffix == ".pyc"
+    )
+
+
+def _walk(root: Path) -> list[Path]:
     files = []
     for path in sorted(root.rglob("*")):
-        rel = path.relative_to(root)
-        if any(part in EXCLUDE for part in rel.parts):
-            continue
-        if path.name == "__pycache__" or path.suffix == ".pyc":
-            continue
         if path.is_dir():
             continue
         files.append(path)
     return files
 
 
+def _git_tracked(root: Path) -> list[Path] | None:
+    """Repo-relative files git would publish, or None outside a git checkout."""
+    try:
+        out = subprocess.run(
+            ["git", "ls-files", "-z"],
+            cwd=root,
+            capture_output=True,
+            check=False,
+        )
+    except OSError:
+        return None
+    if out.returncode != 0:
+        return None
+    names = out.stdout.decode("utf-8", "surrogateescape").split("\0")
+    paths = [root / PurePosixPath(n) for n in names if n]
+    return sorted(p for p in paths if p.is_file() or p.is_symlink())
+
+
+def find_private_payload(rel_paths) -> list[str]:
+    """Return repo-relative paths that must never enter a published archive."""
+    return sorted(str(p) for p in rel_paths if str(p) in PRIVATE_PAYLOAD)
+
+
 def build(plugin_id: str, version: str) -> Path:
     files = collect(REPO)
+    private = find_private_payload(path.relative_to(REPO) for path in files)
+    if private:
+        sys.exit(
+            f"refusing to build: {', '.join(private)} is a private dispatch table "
+            "(real agent ids and internal keywords). The archive ships "
+            "routes.example.json only; keep your own table in the installed plugin "
+            "directory, which is gitignored."
+        )
     for path in files:
         if path.is_symlink():
             sys.exit(

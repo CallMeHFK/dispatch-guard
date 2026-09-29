@@ -4,8 +4,8 @@
 
 Stdlib-only: ``backend/main.py`` degrades its AgentScope/QwenPaw imports to
 local stand-ins, so this suite runs anywhere (GitHub CI included) without
-installing the host. Mode flips are injected through ``_CONFIG_CACHE`` so the
-shipped ``routes.json`` is never touched.
+installing the host. Mode flips are injected through ``_CONFIG_CACHE`` from the
+shipped ``routes.example.json``, so no test ever needs a real dispatch table.
 """
 import asyncio
 import json
@@ -54,27 +54,46 @@ class DispatchGuardTest(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.ws = self.tmp.name
         self.saved_cache = dict(dg._CONFIG_CACHE)
+        self.saved_plugin_dir = dg.PLUGIN_DIR
+        self.saved_logged = dg._UNCONFIGURED_LOGGED
+        # The host installs plugins outside the agent workspace; mirroring that is
+        # what keeps PLUGIN_DIR paths absolute through _rel() and lets the
+        # absolute-path-only plugin whitelist fire.
+        self.plugin_tmp = tempfile.TemporaryDirectory()
+        self.plugin_tree = Path(self.plugin_tmp.name)
+        self.routes_path = self.plugin_tree / "routes.json"
+        # _load_config() stats PLUGIN_DIR/routes.json before touching the cache, so
+        # a test that wants a configured state must write that file for real.
+        dg.PLUGIN_DIR = self.plugin_tree
         self._inject_mode("enforce")
         self.mw = dg.DispatchGuardMiddleware(self.ws, "enforce")
 
     def tearDown(self):
         dg._CONFIG_CACHE.clear()
         dg._CONFIG_CACHE.update(self.saved_cache)
+        dg.PLUGIN_DIR = self.saved_plugin_dir
+        dg._UNCONFIGURED_LOGGED = self.saved_logged
         self.tmp.cleanup()
+        self.plugin_tmp.cleanup()
 
     @staticmethod
-    def _inject_mode(mode):
-        cfg = json.loads((REPO / "routes.json").read_text(encoding="utf-8"))
+    def _bust_config_cache():
+        dg._CONFIG_CACHE.clear()
+        dg._CONFIG_CACHE.update({"mtime": 0.0, "data": None})
+        dg._UNCONFIGURED_LOGGED = False
+
+    def _inject_mode(self, mode):
+        cfg = json.loads((REPO / "routes.example.json").read_text(encoding="utf-8"))
         cfg["mode"] = mode
-        dg._CONFIG_CACHE["data"] = cfg
-        dg._CONFIG_CACHE["mtime"] = (REPO / "routes.json").stat().st_mtime  # pin: no reload during the test
+        self.routes_path.write_text(json.dumps(cfg, ensure_ascii=False), encoding="utf-8")
+        self._bust_config_cache()
 
     # -- write tools ------------------------------------------------------
 
     def test_deny_deliverable_write_with_route_hint(self):
         r = run(self.mw, "write_file", {"file_path": "outputs/report.docx"})
         self.assertEqual(r[0].state, "denied")
-        self.assertIn("IPP", r[0].content[0].text)
+        self.assertIn("DocAgent", r[0].content[0].text)
 
     def test_allow_whitelist_dir(self):
         r = run(self.mw, "write_file", {"file_path": "memory/2026-09-28.md"})
@@ -99,8 +118,8 @@ class DispatchGuardTest(unittest.TestCase):
     def test_ascii_keyword_word_boundary(self):
         # "CI" must not match inside "asyncio".
         self.assertEqual(self.mw._route_hit("import asyncio"), (None, None))
-        agent, why = self.mw._route_hit("setup CI pipeline")
-        self.assertEqual(agent, "Codex_Agent")
+        agent, _why = self.mw._route_hit("setup CI pipeline")
+        self.assertEqual(agent, "CodeAgent")
 
     def test_plugin_dir_is_whitelisted(self):
         plugin_file = str(dg.PLUGIN_DIR / "backend" / "main.py")
@@ -128,7 +147,7 @@ class DispatchGuardTest(unittest.TestCase):
     # -- factory / modes ---------------------------------------------------
 
     def test_factory_only_attaches_default_agent(self):
-        self.assertIsNone(dg._factory(FakeCtx(self.ws), FakeCfg("Codex_Agent")))
+        self.assertIsNone(dg._factory(FakeCtx(self.ws), FakeCfg("CodeAgent")))
         self.assertIsNotNone(dg._factory(FakeCtx(self.ws), FakeCfg("default")))
 
     def test_mode_off_removes_factory(self):
@@ -146,6 +165,48 @@ class DispatchGuardTest(unittest.TestCase):
             self.assertIn("warn", r[0].content[1].text)
         finally:
             self._inject_mode("enforce")
+
+    # -- unconfigured install (no routes.json shipped in the repo) ----------
+
+    def _fresh_plugin_tree(self, routes_content=None):
+        """Rewrite the temp plugin tree; no routes.json unless content is given."""
+        if routes_content is None:
+            self.routes_path.unlink(missing_ok=True)
+        else:
+            self.routes_path.write_text(routes_content, encoding="utf-8")
+        self._bust_config_cache()
+        return self.plugin_tree
+
+    def test_missing_routes_json_attaches_and_asks_to_configure(self):
+        with self.assertLogs("dispatch_guard.qwenpaw", level="WARNING") as logs:
+            tree = self._fresh_plugin_tree()
+            mw = dg._factory(FakeCtx(self.ws), FakeCfg("default"))
+        self.assertTrue(any("unconfigured" in line for line in logs.output))
+        self.assertIsNotNone(mw, "unconfigured must not detach: a silent no-op "
+                                 "install reads like a working one")
+        self.assertEqual(mw._mode, dg.UNCONFIGURED)
+        self.assertFalse((tree / "routes.json").exists())
+
+        r = run(mw, "write_file", {"file_path": "outputs/report.docx"})
+        self.assertEqual(len(r), 1, "deliverable write must pass, not deny")
+        self.assertNotEqual(r[0].state, "denied")
+        block = r[0].content[1].text
+        self.assertIn("routes.json", block)
+        self.assertIn("routes.example.json", block)
+
+        audit = Path(self.ws) / "logs" / "dispatch_guard.jsonl"
+        records = [json.loads(line) for line in audit.read_text(encoding="utf-8").splitlines()]
+        self.assertEqual(records[-1]["action"], "needs_config")
+        self.assertEqual(records[-1]["mode"], dg.UNCONFIGURED)
+
+    def test_malformed_routes_json_still_fails_open(self):
+        # Distinct from a missing file: a table we cannot read must not become a
+        # blanket blocker, so the pre-0.1.2 fail-open design stands.
+        self._fresh_plugin_tree("{ not json")
+        with self.assertLogs("dispatch_guard.qwenpaw", level="ERROR") as logs:
+            self.assertEqual(dg._load_config()["mode"], "off")
+            self.assertIsNone(dg._factory(FakeCtx(self.ws), FakeCfg("default")))
+        self.assertTrue(any("failing open" in line for line in logs.output))
 
 
 if __name__ == "__main__":

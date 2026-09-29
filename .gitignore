@@ -1,4 +1,31 @@
+# Private dispatch table — never commit. The repo ships routes.example.json only;
+# your real table belongs in the installed plugin directory
+# (~/.qwenpaw/plugins/dispatch-guard/routes.json).
+routes.json
+
+# Python
 __pycache__/
-*.pyc
-.DS_Store
+*.py[cod]
+*.egg-info/
+.eggs/
+
+# Environments
+.venv/
+.env
+
+# Build artifacts
 dist/
+build/
+
+# Tool caches
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# Agent / editor state
+.qoder/
+.DS_Store
+
+# Interception log, if you point the plugin at this checkout
+logs/
