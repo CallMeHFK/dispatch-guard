@@ -1,7 +1,7 @@
 {
   "id": "dispatch-guard",
   "name": "Dispatch Guard",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Middleware that enforces an orchestrator agent's output routing at the tool seam: denies deliverable writes outside a whitelist, warns on shell commands that produce deliverables, and backstops a disabled spawn_subagent",
   "description_i18n": {
     "zh-CN": "在工具接缝层强制编排 agent 的产出路由：白名单外的交付物写入直接拒绝并提示派发给对应 agent，shell 交付物启发式仅警告，spawn_subagent 兜底拦截",
@@ -17,6 +17,6 @@
     "max": "2.3.0"
   },
   "meta": {
-    "notes": "No agent-facing tools. Configuration lives in routes.json next to plugin.json: mode (enforce|warn|off, hot-reloaded by mtime), routes (keyword -> agent), ext_routes (extension -> agent). Interception log: <workspace>/logs/dispatch_guard.jsonl"
+    "notes": "No agent-facing tools. The plugin ships routes.example.json (a sanitized sample table); you write your own routes.json next to plugin.json: mode (enforce|warn|off, hot-reloaded by mtime), routes (keyword -> agent), ext_routes (extension -> agent). No routes.json = unconfigured mode: attached, warns how to configure, never denies. Interception log: <workspace>/logs/dispatch_guard.jsonl"
   }
 }

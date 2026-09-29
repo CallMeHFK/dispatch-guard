@@ -1,0 +1,45 @@
+{
+  "mode": "warn",
+  "routes": [
+    {
+      "match": ["文档", "报告", "论文", "汇报", "docx", "pdf", "markdown"],
+      "agent": "DocAgent"
+    },
+    {
+      "match": ["代码", "脚本", "重构", "调试", "code", "python", "script", "refactor", "debug", "CI"],
+      "agent": "CodeAgent"
+    },
+    {
+      "match": ["硬件", "原理图", "固件", "pcb", "schematic", "kicad", "firmware", "cad", "dxf", "gcode", "step"],
+      "agent": "HardwareAgent"
+    },
+    {
+      "match": ["图", "海报", "架构", "视频", "chart", "diagram", "image", "video", "poster", "infographic", "svg"],
+      "agent": "DesignAgent"
+    },
+    {
+      "match": ["工单", "报表", "知识库", "内部系统", "ticket", "tracking", "wiki search"],
+      "agent": "OpsAgent"
+    },
+    {
+      "match": ["打车", "地图", "网盘", "咖啡", "音乐", "点单", "外卖", "社媒"],
+      "agent": "LifeAgent"
+    }
+  ],
+  "ext_routes": {
+    ".docx": "DocAgent",
+    ".pptx": "DocAgent",
+    ".xlsx": "DocAgent",
+    ".pdf": "DocAgent",
+    ".py": "CodeAgent",
+    ".svg": "DesignAgent",
+    ".png": "DesignAgent",
+    ".mp4": "DesignAgent",
+    ".dxf": "HardwareAgent",
+    ".gcode": "HardwareAgent",
+    ".sdf": "HardwareAgent",
+    ".srdf": "HardwareAgent",
+    ".step": "HardwareAgent",
+    ".kicad_pcb": "HardwareAgent"
+  }
+}
