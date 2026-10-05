@@ -71,6 +71,11 @@ jobs:
       - name: Run tests
         run: python -m unittest discover -s tests
 
+      - name: Lint
+        run: |
+          pip install "ruff==0.16.8"
+          ruff check .
+
       - name: Build the QwenPaw plugin archive
         run: python packaging/build_plugin_zip.py --tag "$TAG"
 

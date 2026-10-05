@@ -1,7 +1,7 @@
 {
   "id": "dispatch-guard",
   "name": "Dispatch Guard",
-  "version": "0.1.6",
+  "version": "0.1.7",
   "description": "Middleware that enforces an orchestrator agent's output routing at the tool seam: denies deliverable-shaped writes (deliverable dirs/extensions, outside the whitelist) with a dispatch hint, warns on shell commands producing deliverables, and backstops a disabled spawn_subagent. Reads and basic file operations are never intercepted.",
   "description_i18n": {
     "zh-CN": "在工具接缝层强制编排 agent 的产出路由：交付物形状的写入（交付物目录/扩展名，白名单外）直接拒绝并提示派发给对应 agent，shell 交付物启发式仅警告，spawn_subagent 兜底拦截。读操作与基础文件读写永不拦截。",
