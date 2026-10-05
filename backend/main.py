@@ -82,6 +82,10 @@ logger = logging.getLogger("dispatch_guard.qwenpaw")
 
 PLUGIN_DIR = Path(__file__).resolve().parent.parent
 
+# Audit trail rotation threshold: roll dispatch_guard.jsonl into a single
+# .jsonl.1 backup when it exceeds this size.
+AUDIT_MAX_BYTES = 1 << 20
+
 WRITE_TOOLS = {
     "write_file",
     "edit_file",
@@ -318,7 +322,7 @@ def _deliverable_exts(cfg: dict[str, Any]) -> frozenset[str]:
 # day) are excluded from the inventory, and so is ``default`` — the
 # orchestrator is never its own dispatch target.
 
-_AGENTS_CACHE: dict[str, Any] = {"ws": None, "agents": None, "ids": frozenset()}
+_AGENTS_CACHE: dict[str, Any] = {"ws": None, "agents": None, "ids": frozenset(), "stamp": None}
 _DRAFT_WRITTEN = False
 _NO_OWNER_LOGGED = False
 
@@ -415,14 +419,52 @@ def _discovery_roots(ws: Path) -> list[Path]:
     return roots
 
 
+def _inventory_stamp(ws_path: Path) -> tuple:
+    """Fingerprint of the inputs discovery reads: directory mtimes (which
+    change when an agent is added or removed), each manifest's mtime (which
+    changes when an agent's duties are edited), and the host config.json's
+    mtime (which carries the enabled flags). Discovery re-runs whenever the
+    fingerprint moves — the inventory is hot-reloaded the same way
+    routes.json is, so an agent parked or enabled mid-process takes effect
+    without a host restart.
+    """
+    parts: list = []
+    host = _host_tree()
+    if host is not None:
+        parts.append(_mtime_or_none(host / "config.json"))
+    for root in _discovery_roots(ws_path):
+        parts.append(_mtime_or_none(root))
+        try:
+            manifests = sorted(root.glob("*/agent.json")) + sorted(root.glob("agent.json"))
+        except OSError:
+            parts.append(None)
+            continue
+        for manifest in manifests:
+            parts.append(_mtime_or_none(manifest))
+    return tuple(parts)
+
+
+def _mtime_or_none(path: Path):
+    try:
+        return path.stat().st_mtime
+    except OSError:
+        return None
+
+
 def _discover_agents(ws: str | Path) -> list[dict[str, Any]]:
-    """Agents installed in this environment, cached per workspace.
+    """Agents installed in this environment, cached per workspace until the
+    inventory inputs change (see _inventory_stamp).
 
     ``default`` (the orchestrator this middleware attaches to) and explicitly
     disabled agents are never dispatch targets and are left out.
     """
     ws_path = Path(ws)
-    if _AGENTS_CACHE["ws"] == str(ws_path) and _AGENTS_CACHE["agents"] is not None:
+    stamp = _inventory_stamp(ws_path)
+    if (
+        _AGENTS_CACHE["ws"] == str(ws_path)
+        and _AGENTS_CACHE["agents"] is not None
+        and _AGENTS_CACHE.get("stamp") == stamp
+    ):
         return _AGENTS_CACHE["agents"]
     found: dict[str, dict[str, Any]] = {}
     try:
@@ -443,7 +485,12 @@ def _discover_agents(ws: str | Path) -> list[dict[str, Any]]:
         if aid not in excluded
     ]
     _AGENTS_CACHE.update(
-        {"ws": str(ws_path), "agents": agents, "ids": frozenset(a["id"] for a in agents)}
+        {
+            "ws": str(ws_path),
+            "agents": agents,
+            "ids": frozenset(a["id"] for a in agents),
+            "stamp": stamp,
+        }
     )
     return agents
 
@@ -559,8 +606,14 @@ class DispatchGuardMiddleware(MiddlewareBase):
         try:
             log_dir = self._ws / "logs"
             log_dir.mkdir(parents=True, exist_ok=True)
+            # Single-generation rotation: the audit trail is evidence, not a
+            # forever-growing file. Keep the most recent window plus one
+            # backup; anything older than that has already served its turn.
+            log_path = log_dir / "dispatch_guard.jsonl"
+            if log_path.exists() and log_path.stat().st_size > AUDIT_MAX_BYTES:
+                log_path.replace(log_dir / "dispatch_guard.jsonl.1")
             record = {"ts": time.time(), "plugin": "dispatch-guard", **record}
-            with (log_dir / "dispatch_guard.jsonl").open("a", encoding="utf-8") as f:
+            with log_path.open("a", encoding="utf-8") as f:
                 f.write(json.dumps(record, ensure_ascii=False) + "\n")
         except Exception:  # noqa: BLE001 - logging must never wedge the agent
             logger.exception("dispatch-guard: log write failed")
@@ -647,11 +700,24 @@ class DispatchGuardMiddleware(MiddlewareBase):
         The single gate for every interception (deny, warn, and the
         unconfigured setup block). Anything not deliverable-shaped is a basic
         operation and must reach the next handler untouched.
+
+        Directory matching is prefix-based for workspace-relative paths
+        (``outputs/x`` is deliverable, ``src/foo/outputs/x`` is a source
+        tree), but segment-based for absolute paths: ``_rel`` leaves absolute
+        targets untouched, so an absolute path into a deliverable directory
+        (``/somewhere/outputs/report``) must match on the segment or the
+        guard simply never sees it.
         """
         p = rel.replace("\\", "/").lower()
         if p.startswith(_deliverable_dirs(cfg)):
             return True
-        return os.path.splitext(p)[1] in _deliverable_exts(cfg)
+        if os.path.splitext(p)[1] in _deliverable_exts(cfg):
+            return True
+        if os.path.isabs(p):
+            segments = set(p.split("/"))
+            if any(d.rstrip("/") in segments for d in _deliverable_dirs(cfg)):
+                return True
+        return False
 
     def _live_owner(self, agent_id: str | None) -> tuple[str | None, bool]:
         """(owner_id, blockable): a block needs a real dispatch target.

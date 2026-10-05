@@ -1,5 +1,40 @@
 # Changelog
 
+## v0.1.7
+
+- **The agent inventory is now hot-reloaded.** Discovery is fingerprinted by
+  mtime over the discovery roots, every manifest, and the host config's
+  enabled flags — adding, editing, parking or re-enabling an agent takes
+  effect on the next guarded call, the same freshness routes.json always
+  had. Previously the inventory was a per-process snapshot, so a parked
+  specialist kept receiving routes (or a new one was never seen) until the
+  host restarted.
+- **Absolute-path writes into deliverable directories are seen.** `_rel`
+  leaves absolute targets untouched, so the `outputs/` prefix match never
+  fired for them; deliverable-directory matching is now segment-based for
+  absolute paths (`/somewhere/outputs/report` is the deliverable dir wherever
+  it sits). Extension matching already covered `.docx`-style absolute
+  targets; this closes the extensionless hole. Workspace-relative paths keep
+  prefix semantics, so `src/myapp/projects/notes.txt` stays a basic
+  operation.
+- Audit trail rotation: `dispatch_guard.jsonl` rolls into a single
+  `.jsonl.1` backup past 1 MiB instead of growing forever.
+- The release workflow now lints with ruff like CI does.
+- Verification record (2026-10-05, enforce mode, draft-derived routes against
+  the live inventory IPP/Designer/PCB_Agent/Codex_Agent/SE/PersonalHelper/
+  SkillEvolver_Agent):
+  - 18-case matrix design-consistent: whitelist, basic writes and reads pass
+    silently; owned deliverables denied with the owning agent named — by
+    extension, directory (relative *and* absolute), or keyword; unowned
+    deliverable classes pass with `no_owner` audit records; shell explicit
+    targets warn by default (`shell_enforce` opts into denial); quoted
+    mentions warn only; spawn stays denied.
+  - The three non-obvious cases were confirmed by direct audit-line
+    inspection: an unmatched deliverable class passes silently under a live
+    inventory (no owner, no block), keyword hits fire on absolute-path
+    filenames, and the extensionless absolute-path case is now visible and
+    routable.
+
 ## v0.1.6
 
 - Review fixes to v0.1.5's coverage features — which had half-applied the

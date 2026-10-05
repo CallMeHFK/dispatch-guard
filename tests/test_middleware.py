@@ -458,6 +458,63 @@ class DispatchGuardTest(unittest.TestCase):
         self._bust_config_cache()
         self.assertEqual({a["id"] for a in dg._discover_agents(self.ws)}, {"IPP"})
 
+    # -- inventory hot-reload & absolute paths -------------------------------
+
+    def test_inventory_refreshes_when_a_manifest_changes(self):
+        # The inventory is mtime-stamped the same way routes.json is: an agent
+        # added or edited mid-process must be visible on the next guarded call
+        # without a host restart.
+        self._make_agents({"DocAgent": ["文档"]})
+        self.assertEqual({a["id"] for a in dg._discover_agents(self.ws)}, {"DocAgent"})
+        self._make_agents({"CodeAgent": ["代码"]})
+        self.assertEqual(
+            {a["id"] for a in dg._discover_agents(self.ws)},
+            {"DocAgent", "CodeAgent"},
+        )
+
+    def test_enabled_flag_refresh_excludes_parked_agent(self):
+        host = self._make_host_tree({"DocAgent": "文档"}, {"DocAgent": {"enabled": True}})
+        self._bust_config_cache()
+        self.assertIn("DocAgent", {a["id"] for a in dg._discover_agents(self.ws)})
+        (host / "config.json").write_text(
+            json.dumps({"agents": {"profiles": {"DocAgent": {"enabled": False}}}}),
+            encoding="utf-8",
+        )
+        self.assertNotIn("DocAgent", {a["id"] for a in dg._discover_agents(self.ws)})
+
+    def test_absolute_path_into_deliverable_dir_is_guarded(self):
+        # _rel leaves absolute targets untouched, so prefix matching against
+        # workspace-relative dirs never fired for them; a segment match does.
+        r = run(self.mw, "write_file", {"file_path": "/somewhere/else/outputs/quarterly-report"})
+        self.assertEqual(r[0].state, "denied")
+
+    def test_deep_relative_projects_dir_stays_a_basic_op(self):
+        # Segment matching is for absolute paths only: a nested projects/ in a
+        # source tree is not the deployment's deliverable directory.
+        r = run(self.mw, "write_file", {"file_path": "src/myapp/projects/notes.txt"})
+        self.assertEqual(r[0].content[0].text, "ok")
+
+    # -- audit trail rotation -------------------------------------------------
+
+    def test_audit_log_rotates_past_max_bytes(self):
+        saved = dg.AUDIT_MAX_BYTES
+        dg.AUDIT_MAX_BYTES = 400
+        try:
+            for _ in range(6):
+                run(self.mw, "write_file", {"file_path": "outputs/report.docx"})
+        finally:
+            dg.AUDIT_MAX_BYTES = saved
+        log = Path(self.ws) / "logs" / "dispatch_guard.jsonl"
+        backup = Path(self.ws) / "logs" / "dispatch_guard.jsonl.1"
+        self.assertTrue(backup.exists(), "rotation keeps one backup generation")
+        self.assertTrue(log.exists())
+        self.assertGreaterEqual(backup.stat().st_size, 400)
+        self.assertLess(
+            log.stat().st_size,
+            400 + 400,  # threshold + at most one record appended after it
+            "after rotation the fresh log starts small",
+        )
+
     # -- draft follows the orchestrator's own dispatch policy ----------------
 
     def _write_default_manifest(self, description):

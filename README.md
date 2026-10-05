@@ -304,12 +304,18 @@ so sanitize before attaching one to an issue.
 
 ## Does it work?
 
-`docs/CHANGELOG.md` records the v0.1.1 production run under `enforce`: a 10-case
-false-positive matrix (whitelist, plugin-tree and trash writes pass silently;
-`outputs/` and `projects/` writes deny with dispatch hints; read-only shell never
-warns) and end-to-end dispatch counts. The known trade-off is deliberate: the
-shell heuristic is content-based, so a bookkeeping heredoc that merely *mentions*
-a deliverable extension earns a non-blocking warning.
+`docs/CHANGELOG.md` records the v0.1.7 verification run under `enforce` — an
+18-case matrix against a live multi-agent inventory: whitelist, basic writes
+and reads pass silently; owned deliverables are denied with the owning agent
+named (by extension, directory — relative or absolute — or keyword); unowned
+deliverable classes pass with `no_owner` audit records; shell explicit targets
+warn by default (`shell_enforce` opts into denial); quoted mentions warn only;
+spawn stays denied. Older per-version records are in the changelog.
+
+Known trade-offs are documented in [docs/DESIGN.md](docs/DESIGN.md): shell
+heuristics are content-based (a bookkeeping heredoc that merely *mentions* a
+deliverable earns a non-blocking warning), and a deliverable class no rule
+covers passes with an audit record instead of a denial.
 
 ## Development
 
