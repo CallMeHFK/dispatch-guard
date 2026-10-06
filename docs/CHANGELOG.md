@@ -21,8 +21,7 @@
   `.jsonl.1` backup past 1 MiB instead of growing forever.
 - The release workflow now lints with ruff like CI does.
 - Verification record (2026-10-05, enforce mode, draft-derived routes against
-  the live inventory IPP/Designer/PCB_Agent/Codex_Agent/SE/PersonalHelper/
-  SkillEvolver_Agent):
+  the live inventory of seven specialist workspaces):
   - 18-case matrix design-consistent: whitelist, basic writes and reads pass
     silently; owned deliverables denied with the owning agent named — by
     extension, directory (relative *and* absolute), or keyword; unowned
@@ -101,13 +100,13 @@ full paper-to-decision mapping now lives in [docs/RESEARCH.md](RESEARCH.md).
   day, like this deployment's Qoder, does not receive routes). A broken or
   missing config.json excludes nothing — fail open.
 - **Drafts follow the environment's own declared policy.** The orchestrator's
-  `agent.json` description states the routing intent in prose ("专利/规格书/
-  Office文档派 IPP，图形/图像/视频/PPT派 Designer…"); the draft parses those
+  `agent.json` description states the routing intent in prose ("文档/报告/
+  Office文档派 DocAgent，图形/图像/视频/PPT派 DesignAgent…"); the draft parses those
   "X派Y" claims and routes each deliverable category to the agent the
   operator already named, dropping claims that point at agents outside the
   live inventory. The id/skills/description scan remains only as a fallback
   for deployments without a written policy. On the reference deployment the
-  generated draft now routes documents→IPP, media→Designer, CAD→PCB_Agent
+  generated draft now routes documents→DocAgent, media→DesignAgent, CAD→HardwareAgent
   with archives unrouted — matching the declared policy exactly.
 
 ## v0.1.3

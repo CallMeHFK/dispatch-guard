@@ -499,7 +499,7 @@ def _dispatch_policy(ws: str | Path, agents: list[dict[str, Any]]) -> list[tuple
     """(keyword token -> agent id) parsed from the orchestrator's own words.
 
     Deployments state their routing intent in the default agent.json
-    description ("专利/规格书/Office文档派 IPP，代码/仿真/CI派 Codex_Agent…").
+    description ("文档/报告/Office文档派 DocAgent，代码/仿真/CI派 CodeAgent…").
     Each "X派Y" claim yields one token per slash-separated term on the left;
     segment order is declaration order, so earlier claims outrank later ones.
     Claims naming an agent that is not in the live inventory are dropped —

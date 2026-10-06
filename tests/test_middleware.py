@@ -429,8 +429,8 @@ class DispatchGuardTest(unittest.TestCase):
 
     def test_host_workspace_layout_is_discovered(self):
         host = self._make_host_tree(
-            {"IPP": "验收报告", "Designer": "图形", "default": "编排者"},
-            {"IPP": {"enabled": True}, "Designer": {"enabled": True}, "Qoder": {"enabled": False}},
+            {"DocAgent": "合同标书", "DesignAgent": "图形", "default": "编排者"},
+            {"DocAgent": {"enabled": True}, "DesignAgent": {"enabled": True}, "Qoder": {"enabled": False}},
         )
         (host / "workspaces" / "Qoder").mkdir()
         (host / "workspaces" / "Qoder" / "agent.json").write_text(
@@ -439,8 +439,8 @@ class DispatchGuardTest(unittest.TestCase):
         )
         self._bust_config_cache()
         ids = {a["id"] for a in dg._discover_agents(self.ws)}
-        self.assertIn("IPP", ids)
-        self.assertIn("Designer", ids)
+        self.assertIn("DocAgent", ids)
+        self.assertIn("DesignAgent", ids)
         self.assertNotIn("default", ids, "the orchestrator is never a dispatch target")
         self.assertNotIn("Qoder", ids, "explicitly disabled agents are not dispatch targets")
 
@@ -450,13 +450,13 @@ class DispatchGuardTest(unittest.TestCase):
         host = Path(self.plugin_tmp.name) / "host"
         dg.PLUGIN_DIR = host / "plugins" / "dispatch-guard"
         dg.PLUGIN_DIR.mkdir(parents=True, exist_ok=True)
-        (host / "workspaces" / "IPP").mkdir(parents=True)
-        (host / "workspaces" / "IPP" / "agent.json").write_text(
-            json.dumps({"id": "IPP"}, ensure_ascii=False), encoding="utf-8"
+        (host / "workspaces" / "DocAgent").mkdir(parents=True)
+        (host / "workspaces" / "DocAgent" / "agent.json").write_text(
+            json.dumps({"id": "DocAgent"}, ensure_ascii=False), encoding="utf-8"
         )
         (host / "config.json").write_text("{ not json", encoding="utf-8")
         self._bust_config_cache()
-        self.assertEqual({a["id"] for a in dg._discover_agents(self.ws)}, {"IPP"})
+        self.assertEqual({a["id"] for a in dg._discover_agents(self.ws)}, {"DocAgent"})
 
     # -- inventory hot-reload & absolute paths -------------------------------
 
@@ -524,23 +524,23 @@ class DispatchGuardTest(unittest.TestCase):
         )
 
     def test_draft_parses_dispatch_policy_from_default_manifest(self):
-        # The real deployment states routing in default's description:
-        # "专利/规格书/Office文档派 IPP，图形/图像/视频/PPT派 Designer，…"
-        self._make_agents({"IPP": ["专利"], "Designer": ["图形"], "CodeAgent": ["代码"]})
+        # A deployment states routing in default's description:
+        # "文档/报告/Office文档派 DocAgent，图形/图像/视频/PPT派 DesignAgent，…"
+        self._make_agents({"DocAgent": ["文档"], "DesignAgent": ["图形"], "CodeAgent": ["代码"]})
         self._write_default_manifest(
-            "编排者：分解任务、派发与验收汇总；专利/规格书/Office文档派 IPP，"
-            "图形/图像/视频/PPT派 Designer，代码/仿真/CI派 CodeAgent；"
-            "Qoder 仅 Han 点名时派；自身不直接执行专业工作"
+            "编排者：分解任务、派发与验收汇总；文档/报告/Office文档派 DocAgent，"
+            "图形/图像/视频/PPT派 DesignAgent，代码/仿真/CI派 CodeAgent；"
+            "第三方宿主仅显式点名时派；自身不直接执行专业工作"
         )
         cfg = dg._draft_route_table(self.ws)
         self.assertIsNotNone(cfg)
         self.assertEqual(cfg["mode"], "warn")
-        self.assertEqual(cfg["ext_routes"][".docx"], "IPP")
-        self.assertEqual(cfg["ext_routes"][".png"], "Designer")
+        self.assertEqual(cfg["ext_routes"][".docx"], "DocAgent")
+        self.assertEqual(cfg["ext_routes"][".png"], "DesignAgent")
         self.assertNotIn(".dxf", cfg["ext_routes"], "no hardware claim in the policy")
         self.assertNotIn(".py", cfg["ext_routes"], "code stays a basic operation")
         agents = {route["agent"] for route in cfg["routes"]}
-        self.assertEqual(agents, {"IPP", "Designer"})
+        self.assertEqual(agents, {"DocAgent", "DesignAgent"})
 
     def test_policy_claim_to_absent_agent_is_dropped(self):
         # "Office文档派 DocAgent" with no DocAgent installed must not route
