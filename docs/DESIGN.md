@@ -102,7 +102,7 @@ artifacts, archives) mapped to the first discovered agent whose
 id/skills/description mentions the category, `mode` pinned to `warn`.
 
 When the orchestrator states its routing policy in its own `agent.json`
-description ("专利/规格书/Office文档派 IPP，…"), that policy outranks any
+description ("文档/报告/Office文档派 DocAgent，…"), that policy outranks any
 guess: each "X派Y" claim maps its slash-separated keywords to the named
 agent, claims naming agents outside the live inventory are dropped, and only
 categories the policy leaves uncovered fall back to the manifest scan. The
