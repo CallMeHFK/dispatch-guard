@@ -1,5 +1,43 @@
 # Changelog
 
+## v0.1.8
+
+- **Path traversal can no longer dress a destination as something else.** When
+  a target escaped the workspace, `_rel` handed back the raw un-normalized
+  string, so `notes/../../outputs/report.docx` inherited the `notes/` whitelist
+  prefix and passed untouched in every mode while the identical real
+  destination was denied; the reverse spelling was audited as a deliverable.
+  Escaped targets now resolve to their real absolute location before any
+  prefix matching, and unresolvable paths (`..` through a symlink loop) fall
+  back to syntactic normalization.
+- **Structurally wrong configs degrade instead of crashing.** A host
+  config.json with `"agents": null` (or `profiles` as an array) raised
+  `AttributeError` out of discovery and crashed every guarded tool call; a
+  routes.json whose `ext_routes`/`routes` were the wrong JSON type failed open
+  once and then crashed every later call from the poisoned cache. All config
+  fields are now type-normalized at load — a wrong-typed field is dropped with
+  a warning, and non-object routes.json fails open to `off`.
+- **ffmpeg's real output form is covered.** ffmpeg has no `-o` flag, so
+  `ffmpeg -i clip.mov clip.mp4` was invisible to the shell heuristics; the
+  trailing positional output is now an explicit target (an `-i` input is not
+  mistaken for one). Converter destination flags gained `--outdir` /
+  `--output[-dir]=`, and naming the deliverable directory itself
+  (`--outdir outputs`) counts as a target.
+- **Draft dispatch policies lose fewer claims.** Sentences separated by `。`,
+  claims phrased as "派给/派到/派至 X", and several claims in one segment are
+  all parsed now; previously only the first claim per punctuation segment was
+  read, silently dropping whole routing groups from routes.draft.json.
+- A transient I/O error during agent discovery no longer caches a partial
+  inventory under the unchanged stamp (which would have invented no_owner
+  verdicts until the next manifest edit); failed discovery is retried on the
+  next guarded call.
+- Audit attribution: the generic deny hint "对应专业 agent" (no live
+  discovery) is no longer counted as an agent by `audit_summary.py`, and
+  glob patterns like `find . -name '*.docx'` no longer earn a shell warning.
+- `packaging/release_notes.py` exits non-zero when the tag has no changelog
+  section: the publish step runs under `set -e`, so a release now fails
+  loudly instead of shipping placeholder notes.
+
 ## v0.1.7
 
 - **The agent inventory is now hot-reloaded.** Discovery is fingerprinted by

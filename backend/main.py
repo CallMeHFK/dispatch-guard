@@ -147,9 +147,20 @@ WHITELIST_FILES = {
 SHELL_OUTPUT_PATTERNS = (
     re.compile(r"(?:>>|\btee\b(?:\s+-\w+)*\s+|>)\s*([^\s;&|]+)", re.I),
     re.compile(
-        r"\b(?:pandoc|ffmpeg|soffice|libreoffice)\b[^;&|]*?-o\s+([^\s;&|]+)", re.I
+        r"\b(?:pandoc|ffmpeg|soffice|libreoffice)\b[^;&|]*?"
+        r"(?:--outdir(?:=|\s+)|--output(?:-dir)?(?:=|\s+)|-o\s+)([^\s;&|]+)",
+        re.I,
     ),
     re.compile(r"\b(?:cp|mv|rsync|install)\b[^;&|]*\s+([^\s;&|]+)", re.I),
+    # ffmpeg's real output form is positional: the last argument of the
+    # command line, carrying an extension. The -i lookahead keeps a bare
+    # converter line from matching, and the lookbehind keeps an `-i` input
+    # ("ffmpeg -i clip.mov", a probe, not a write) from posing as the output.
+    re.compile(
+        r"\bffmpeg\b(?=[^;&|]*\s-i\s)[^;&|]*?\s(?<!-i\s)"
+        r"([^\s;&|]*\.[A-Za-z0-9]{1,12})(?=\s*(?:[;&|]|$))",
+        re.I,
+    ),
 )
 # Quoted file paths appearing anywhere in a command or code body. A path in
 # a quoted string is a MENTION — it names a deliverable the tool may write
@@ -189,6 +200,53 @@ def _warn_unconfigured() -> None:
     )
 
 
+def _normalize_config(data: Any) -> dict[str, Any]:
+    """Coerce a structurally wrong routes.json into the shape the runtime
+    reads, so one field's type mistake degrades that field to "absent"
+    instead of crashing every interception later (the fail-open rule is
+    about not wedging the agent on a config typo). Each dropped field says
+    so in the host log, once per file change.
+    """
+    if not isinstance(data, dict):
+        logger.warning(
+            "dispatch-guard: routes.json must be a JSON object with a mode "
+            "field; the file is ignored (failing open to off)"
+        )
+        return {"mode": "off", "routes": [], "ext_routes": {}}
+    cfg = dict(data)
+    if not isinstance(cfg.get("ext_routes"), dict):
+        logger.warning(
+            "dispatch-guard: routes.json 'ext_routes' must be a JSON object; "
+            "extension routing is ignored"
+        )
+        cfg["ext_routes"] = {}
+    routes = cfg.get("routes")
+    if not isinstance(routes, list):
+        logger.warning(
+            "dispatch-guard: routes.json 'routes' must be a JSON array; "
+            "keyword routing is ignored"
+        )
+        routes = []
+    cleaned: list[Any] = []
+    for rule in routes:
+        if not isinstance(rule, dict):
+            logger.warning(
+                "dispatch-guard: routes entry %r is not an object; dropped", rule
+            )
+            continue
+        match = rule.get("match")
+        if match is not None and not isinstance(match, list):
+            logger.warning(
+                "dispatch-guard: route for %r has a non-array 'match'; its "
+                "keywords are dropped",
+                rule.get("agent"),
+            )
+            rule = {**rule, "match": []}
+        cleaned.append(rule)
+    cfg["routes"] = cleaned
+    return cfg
+
+
 def _load_config() -> dict[str, Any]:
     """Read routes.json, cached by mtime so mode flips apply without reload."""
     path = PLUGIN_DIR / "routes.json"
@@ -199,9 +257,13 @@ def _load_config() -> dict[str, Any]:
         return {"mode": UNCONFIGURED, "routes": [], "ext_routes": {}}
     if _CONFIG_CACHE["data"] is None or mtime != _CONFIG_CACHE["mtime"]:
         try:
-            _CONFIG_CACHE["data"] = json.loads(path.read_text(encoding="utf-8"))
+            # Normalize BEFORE committing to the cache: the cache must only
+            # ever hold dicts the runtime can read, or a malformed rewrite
+            # would fail open once and then crash every later call.
+            data = _normalize_config(json.loads(path.read_text(encoding="utf-8")))
+            _CONFIG_CACHE["data"] = data
             _CONFIG_CACHE["mtime"] = mtime
-            _lint_policy(_CONFIG_CACHE["data"])
+            _lint_policy(data)
         except Exception:  # noqa: BLE001 - fail open
             logger.exception("dispatch-guard: bad routes.json, failing open")
             return {"mode": "off", "routes": [], "ext_routes": {}}
@@ -326,8 +388,8 @@ _AGENTS_CACHE: dict[str, Any] = {"ws": None, "agents": None, "ids": frozenset(),
 _DRAFT_WRITTEN = False
 _NO_OWNER_LOGGED = False
 
-_POLICY_SEGMENT = re.compile(r"[，,；;\n]")
-_POLICY_CLAIM = re.compile(r"(.+?)派\s*([A-Za-z_][A-Za-z0-9_-]*)")
+_POLICY_SEGMENT = re.compile(r"[，,；;\n。！？]")
+_POLICY_CLAIM = re.compile(r"(.+?)派(?:给|到|至)?\s*([A-Za-z_][A-Za-z0-9_-]*)")
 _POLICY_TOKEN = re.compile(r"[/、]")
 
 # Category presets used to draft a dispatch table from discovered agents:
@@ -389,23 +451,26 @@ def _host_tree() -> Path | None:
 def _disabled_agent_ids() -> frozenset[str]:
     """Agent ids the host has explicitly disabled (config.json profiles).
 
-    Reading the host config is best-effort: an unreadable or absent file
-    means no exclusions, never a smaller inventory — a missing enable-flag
-    must not invent a "no owner" verdict.
+    Reading the host config is best-effort: an unreadable, absent or
+    structurally wrong file means no exclusions, never a smaller inventory —
+    a missing enable-flag must not invent a "no owner" verdict.
     """
     host = _host_tree()
     if host is None:
         return frozenset()
     try:
         cfg = json.loads((host / "config.json").read_text(encoding="utf-8"))
-        profiles = cfg.get("agents", {}).get("profiles", {})
-        return frozenset(
-            str(aid)
-            for aid, profile in profiles.items()
-            if isinstance(profile, dict) and profile.get("enabled") is False
-        )
     except (OSError, ValueError):
         return frozenset()
+    agents = cfg.get("agents") if isinstance(cfg, dict) else None
+    profiles = agents.get("profiles") if isinstance(agents, dict) else None
+    if not isinstance(profiles, dict):
+        return frozenset()
+    return frozenset(
+        str(aid)
+        for aid, profile in profiles.items()
+        if isinstance(profile, dict) and profile.get("enabled") is False
+    )
 
 
 def _discovery_roots(ws: Path) -> list[Path]:
@@ -467,6 +532,7 @@ def _discover_agents(ws: str | Path) -> list[dict[str, Any]]:
     ):
         return _AGENTS_CACHE["agents"]
     found: dict[str, dict[str, Any]] = {}
+    discovery_failed = False
     try:
         for root in _discovery_roots(ws_path):
             if not root.is_dir():
@@ -478,20 +544,25 @@ def _discover_agents(ws: str | Path) -> list[dict[str, Any]]:
                     found[parsed["id"]] = parsed
     except OSError:
         logger.exception("dispatch-guard: agent discovery failed")
+        # Do not cache a partial inventory: the stamp did not move, so a
+        # cached failure would never be retried and would invent no_owner
+        # verdicts for agents that are actually installed.
+        discovery_failed = True
     excluded = _disabled_agent_ids() | {"default"}
     agents = [
         found[aid]
         for aid in sorted(found)
         if aid not in excluded
     ]
-    _AGENTS_CACHE.update(
-        {
-            "ws": str(ws_path),
-            "agents": agents,
-            "ids": frozenset(a["id"] for a in agents),
-            "stamp": stamp,
-        }
-    )
+    if not discovery_failed:
+        _AGENTS_CACHE.update(
+            {
+                "ws": str(ws_path),
+                "agents": agents,
+                "ids": frozenset(a["id"] for a in agents),
+                "stamp": stamp,
+            }
+        )
     return agents
 
 
@@ -501,9 +572,10 @@ def _dispatch_policy(ws: str | Path, agents: list[dict[str, Any]]) -> list[tuple
     Deployments state their routing intent in the default agent.json
     description ("文档/报告/Office文档派 DocAgent，代码/仿真/CI派 CodeAgent…").
     Each "X派Y" claim yields one token per slash-separated term on the left;
-    segment order is declaration order, so earlier claims outrank later ones.
-    Claims naming an agent that is not in the live inventory are dropped —
-    a policy pointing at a disabled or removed specialist is not a route.
+    every claim in a segment is taken (finditer), and segment order is
+    declaration order, so earlier claims outrank later ones. Claims naming an
+    agent that is not in the live inventory are dropped — a policy pointing
+    at a disabled or removed specialist is not a route.
     """
     try:
         manifest = json.loads((Path(ws) / "agent.json").read_text(encoding="utf-8"))
@@ -513,13 +585,13 @@ def _dispatch_policy(ws: str | Path, agents: list[dict[str, Any]]) -> list[tuple
     known = {agent["id"] for agent in agents}
     policy: list[tuple[str, str]] = []
     for segment in _POLICY_SEGMENT.split(description):
-        claim = _POLICY_CLAIM.search(segment)
-        if not claim or claim.group(2) not in known:
-            continue
-        for token in _POLICY_TOKEN.split(claim.group(1)):
-            token = token.strip()
-            if token:
-                policy.append((token, claim.group(2)))
+        for claim in _POLICY_CLAIM.finditer(segment):
+            if claim.group(2) not in known:
+                continue
+            for token in _POLICY_TOKEN.split(claim.group(1)):
+                token = token.strip()
+                if token:
+                    policy.append((token, claim.group(2)))
     return policy
 
 
@@ -646,9 +718,10 @@ class DispatchGuardMiddleware(MiddlewareBase):
         """(rel, explicit) deliverable-shaped paths named inside a blob.
 
         Two confidence tiers, ordered explicit-first: an explicit output
-        target (redirect/tee/-o/cp-destination) is where bytes land and may
-        be denied under the right mode; a quoted path is only a mention —
-        enough to warn about, never enough to block.
+        target (redirect/tee/converter -o or --outdir/cp destination/ffmpeg's
+        trailing positional output) is where bytes land and may be denied
+        under the right mode; a quoted path is only a mention — enough to
+        warn about, never enough to block.
         """
         found: list[tuple[str, bool]] = []
         seen: set[str] = set()
@@ -660,7 +733,12 @@ class DispatchGuardMiddleware(MiddlewareBase):
                 seen.add(rel)
                 found.append((rel, True))
         for match in MENTION_PATH_RE.finditer(blob):
-            rel = self._rel(match.group(1))
+            raw = match.group(1)
+            if any(ch in raw for ch in "*?["):
+                # A glob pattern ("find . -name '*.docx'") names a class of
+                # files, not a deliverable target.
+                continue
+            rel = self._rel(raw)
             if rel in seen or self._whitelisted(rel) or not self._is_deliverable(rel, cfg):
                 continue
             seen.add(rel)
@@ -672,7 +750,20 @@ class DispatchGuardMiddleware(MiddlewareBase):
             p = Path(target)
             if not p.is_absolute():
                 p = self._ws / p
-            return str(p.resolve().relative_to(self._ws))
+            try:
+                resolved = p.resolve()
+            except (OSError, ValueError, RuntimeError):
+                # Symlink loop, permission wall, NUL byte: syntactic
+                # normalization still collapses "..", which is what the
+                # prefix matchers must not be fooled by.
+                resolved = Path(os.path.normpath(str(p)))
+            try:
+                return str(resolved.relative_to(self._ws))
+            except ValueError:
+                # Resolves outside the workspace: hand back the real absolute
+                # location, never the raw spelling — "notes/../../outputs/x.docx"
+                # must not inherit the whitelist prefix it was dressed in.
+                return str(resolved)
         except Exception:  # noqa: BLE001
             return target
 
@@ -709,13 +800,18 @@ class DispatchGuardMiddleware(MiddlewareBase):
         guard simply never sees it.
         """
         p = rel.replace("\\", "/").lower()
-        if p.startswith(_deliverable_dirs(cfg)):
+        dirs = _deliverable_dirs(cfg)
+        if p.startswith(dirs):
             return True
         if os.path.splitext(p)[1] in _deliverable_exts(cfg):
             return True
+        # The deliverable directory itself named as an output target
+        # (`soffice --convert-to docx --outdir outputs …`) is where bytes land.
+        if p in {d.rstrip("/") for d in dirs}:
+            return True
         if os.path.isabs(p):
             segments = set(p.split("/"))
-            if any(d.rstrip("/") in segments for d in _deliverable_dirs(cfg)):
+            if any(d.rstrip("/") in segments for d in dirs):
                 return True
         return False
 

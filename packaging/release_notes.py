@@ -57,7 +57,10 @@ def main() -> int:
     if not found:
         sys.stderr.write(f"no {args.tag} section in {args.changelog}\n")
     print(text)
-    return 0
+    # Non-zero on a missing section: the release workflow runs under `set -e`,
+    # so a tag without changelog notes fails the publish step instead of
+    # shipping a release page full of placeholder text.
+    return 0 if found else 1
 
 
 if __name__ == "__main__":

@@ -26,16 +26,30 @@ from collections import Counter
 from pathlib import Path
 
 
+def hint_agent(message: str) -> str | None:
+    """The dispatch target a denial names, or None when it names no one.
+
+    The spawn backstop routes to no agent, and the generic deny used when
+    discovery is empty names the placeholder "对应专业 agent" — neither may
+    pollute the per-agent attribution.
+    """
+    if "派发给 " not in message:
+        return None
+    tail = message.split("派发给 ", 1)[-1].split("；", 1)[0].strip()
+    if not tail or tail == "对应专业 agent":
+        return None
+    return tail.split(" ")[0]
+
+
 def summarize(records: list[dict]) -> dict:
     actions = Counter(str(r.get("action", "?")) for r in records)
     modes = Counter(str(r.get("mode", "?")) for r in records)
     # Only deny messages that actually name a dispatch target count toward
-    # the per-agent tally; the spawn backstop denial routes to no agent and
-    # would otherwise pollute the attribution.
+    # the per-agent tally.
     hints = Counter(
-        message.split("派发给 ")[-1].split("；")[0].split(" ")[0]
+        agent
         for message in (str(r.get("message", "")) for r in records if r.get("action") == "denied")
-        if "派发给 " in message
+        if (agent := hint_agent(message)) is not None
     )
     no_owner = Counter(str(r.get("target", "?")) for r in records if r.get("action") == "no_owner")
     top_targets = Counter(str(r.get("target", "?")) for r in records)

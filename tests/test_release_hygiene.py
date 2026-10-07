@@ -11,7 +11,9 @@ both of which still download and still install, just not what the page claims.
 """
 import json
 import re
+import subprocess
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -61,6 +63,41 @@ class ReleaseHygieneTest(unittest.TestCase):
             f"releases/latest/download/{pid}.zip",
             readme,
             f"README never installs {pid}.zip from the releases page",
+        )
+
+    def test_missing_section_exits_nonzero(self):
+        """The publish step runs under `set -e`: a tag without changelog notes
+        must fail the release job, not ship placeholder text as the page."""
+        with tempfile.TemporaryDirectory() as d:
+            changelog = Path(d) / "CHANGELOG.md"
+            changelog.write_text("## v0.0.1\n\n- old\n", encoding="utf-8")
+            rc = subprocess.run(
+                [
+                    sys.executable,
+                    str(REPO / "packaging" / "release_notes.py"),
+                    "v9.9.9",
+                    "--changelog",
+                    str(changelog),
+                ],
+                capture_output=True,
+                text=True,
+            )
+        self.assertNotEqual(rc.returncode, 0)
+        self.assertIn("no v9.9.9 section", rc.stderr)
+
+    def test_found_section_exits_zero(self):
+        rc = subprocess.run(
+            [
+                sys.executable,
+                str(REPO / "packaging" / "release_notes.py"),
+                f"v{MANIFEST['version']}",
+            ],
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(rc.returncode, 0)
+        self.assertNotIn(
+            release_notes.FALLBACK.format(tag=f"v{MANIFEST['version']}"), rc.stdout
         )
 
 
