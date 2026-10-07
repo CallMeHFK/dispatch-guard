@@ -10,6 +10,7 @@ shipped ``routes.example.json``, so no test ever needs a real dispatch table.
 import asyncio
 import json
 import logging
+import shutil
 import sys
 import tempfile
 import unittest
@@ -905,6 +906,112 @@ class DispatchGuardTest(unittest.TestCase):
             agents = dg._discover_agents(self.ws)
         self.assertEqual([a["id"] for a in agents], ["DocAgent"])
         self.assertIsNone(dg._AGENTS_CACHE["agents"], "partial inventory must not be cached")
+
+    # -- private config survives the installer rebuilding the plugin dir -----
+
+    def test_config_survives_plugin_dir_replacement(self):
+        # The host installer rmtree+copies the plugin directory on every
+        # reinstall; a table that lives only there would drop the deployment
+        # back to unconfigured. The load-time mirror into plugin-data makes
+        # the table survive the rebuild.
+        self._host_plugin_tree()
+        cfg = dg._load_config()
+        self.assertEqual(cfg["mode"], "enforce")
+        data_copy = Path(self.plugin_tmp.name) / "host" / "plugin-data" / "dispatch-guard" / "routes.json"
+        self.assertTrue(data_copy.is_file(), "plugin-dir table must be mirrored to plugin-data")
+
+        # Simulate `plugin install --force`: the plugin directory is wiped and
+        # rebuilt from the release payload — no routes.json in it.
+        table_bytes = data_copy.read_bytes()
+        shutil.rmtree(dg.PLUGIN_DIR)
+        dg.PLUGIN_DIR.mkdir(parents=True)
+        (dg.PLUGIN_DIR / "plugin.json").write_text(
+            json.dumps({"id": "dispatch-guard", "version": "0.1.9"}), encoding="utf-8"
+        )
+        self._bust_config_cache()
+        reloaded = dg._load_config()
+        self.assertEqual(reloaded["mode"], "enforce", "table must survive the rebuild")
+        self.assertEqual(reloaded["ext_routes"], cfg["ext_routes"])
+        self.assertEqual(data_copy.read_bytes(), table_bytes)
+
+    def test_plugin_dir_table_outranks_data_dir_copy(self):
+        # The hand-placed table next to plugin.json is the explicit override;
+        # the plugin-data copy only takes over when the plugin-dir one is gone.
+        self._host_plugin_tree({"mode": "enforce"})
+        self.assertEqual(dg._load_config()["mode"], "enforce")
+        override = json.loads((dg.PLUGIN_DIR / "routes.json").read_text(encoding="utf-8"))
+        override["mode"] = "warn"
+        (dg.PLUGIN_DIR / "routes.json").write_text(
+            json.dumps(override, ensure_ascii=False), encoding="utf-8"
+        )
+        self._bust_config_cache()
+        self.assertEqual(dg._load_config()["mode"], "warn", "plugin-dir copy wins")
+        (dg.PLUGIN_DIR / "routes.json").unlink()
+        self._bust_config_cache()
+        # The mirror ran while the override was live, so the data-dir copy
+        # carries the operator's latest edit, not the original.
+        self.assertEqual(dg._load_config()["mode"], "warn", "data-dir copy takes over after reinstall")
+
+    def test_mirror_follows_operator_edits(self):
+        # A stale rescue copy is as bad as none: the mirror must re-sync when
+        # the plugin-dir table changes, not only on first sight.
+        self._host_plugin_tree({"mode": "enforce"})
+        data_copy = Path(self.plugin_tmp.name) / "host" / "plugin-data" / "dispatch-guard" / "routes.json"
+        self.assertEqual(dg._load_config()["mode"], "enforce")
+        edited = json.loads(data_copy.read_text(encoding="utf-8"))
+        edited["mode"] = "off"
+        (dg.PLUGIN_DIR / "routes.json").write_text(
+            json.dumps(edited, ensure_ascii=False), encoding="utf-8"
+        )
+        self._bust_config_cache()
+        self.assertEqual(dg._load_config()["mode"], "off")
+        self.assertEqual(json.loads(data_copy.read_text(encoding="utf-8"))["mode"], "off")
+
+    def test_draft_is_adopted_not_regenerated(self):
+        # A draft regenerated on every process start would clobber operator
+        # edits made between review sessions; an existing draft is adopted.
+        self._host_plugin_tree()
+        data_dir = Path(self.plugin_tmp.name) / "host" / "plugin-data" / "dispatch-guard"
+        data_dir.mkdir(parents=True)
+        operator_edit = {"mode": "warn", "routes": [], "ext_routes": {".docx": "DocAgent"}}
+        (data_dir / "routes.draft.json").write_text(
+            json.dumps(operator_edit, ensure_ascii=False), encoding="utf-8"
+        )
+        self._make_agents({"DocAgent": ["文档"]})
+        self.assertEqual(
+            dg._maybe_write_draft(self.ws),
+            data_dir / "routes.draft.json",
+        )
+        self.assertEqual(
+            json.loads((data_dir / "routes.draft.json").read_text(encoding="utf-8")),
+            operator_edit,
+            "the operator-edited draft must not be regenerated",
+        )
+
+    def test_legacy_draft_in_plugin_dir_is_migrated(self):
+        # Drafts written by pre-plugin-data versions sit in the plugin
+        # directory; the first process after upgrade adopts them into
+        # plugin-data so the next reinstall cannot lose them mid-review.
+        self._host_plugin_tree()
+        legacy = dg.PLUGIN_DIR / "routes.draft.json"
+        legacy.write_text(
+            json.dumps({"mode": "warn", "routes": [], "ext_routes": {}}),
+            encoding="utf-8",
+        )
+        self._make_agents({"DocAgent": ["文档"]})
+        data_draft = Path(self.plugin_tmp.name) / "host" / "plugin-data" / "dispatch-guard" / "routes.draft.json"
+        self.assertEqual(dg._maybe_write_draft(self.ws), data_draft)
+        self.assertTrue(data_draft.is_file(), "legacy draft must be migrated into plugin-data")
+
+    def test_draft_lands_in_plugin_data_under_host_tree(self):
+        self._host_plugin_tree()
+        self._make_agents({"DocAgent": ["文档"]})
+        draft = dg._maybe_write_draft(self.ws)
+        self.assertIsNotNone(draft)
+        self.assertEqual(
+            draft,
+            Path(self.plugin_tmp.name) / "host" / "plugin-data" / "dispatch-guard" / "routes.draft.json",
+        )
 
 
 if __name__ == "__main__":
