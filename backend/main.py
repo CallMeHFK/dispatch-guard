@@ -42,6 +42,7 @@ import json
 import logging
 import os
 import re
+import shutil
 import time
 from collections.abc import AsyncGenerator, Callable
 from pathlib import Path
@@ -170,13 +171,13 @@ SHELL_OUTPUT_PATTERNS = (
 # these paths, and the fail-open rule is about not stranding work on a guess.
 MENTION_PATH_RE = re.compile(r"""["']([^"'`]*\.[A-Za-z0-9]{1,12})["']""")
 
-_CONFIG_CACHE: dict[str, Any] = {"mtime": 0.0, "data": None}
+_CONFIG_CACHE: dict[str, Any] = {"mtime": 0.0, "data": None, "source": None}
 _UNCONFIGURED_LOGGED = False
 
 UNCONFIGURED = "unconfigured"
 SETUP_HINT = (
-    "[dispatch-guard 未配置] 插件目录下没有 routes.json，派发表为空，"
-    "当前只提示不拦截。请和用户一起确认各类产出归属哪个 agent，"
+    "[dispatch-guard 未配置] 没有 routes.json（插件目录和 plugin-data 目录都查过），"
+    "派发表为空，当前只提示不拦截。请和用户一起确认各类产出归属哪个 agent，"
     "把结论写成 routes.json（可从 routes.example.json 复制起步）："
     "mode 先设 warn 观察一轮拦截日志，确认派发表无误后再切 enforce。"
     "目标：{target}"
@@ -247,15 +248,95 @@ def _normalize_config(data: Any) -> dict[str, Any]:
     return cfg
 
 
+def _data_dir() -> Path:
+    """Durable home for the operator's private plugin state.
+
+    The host installer replaces the plugin directory wholesale on every
+    reinstall (rmtree + copytree), so anything the operator owns — the
+    dispatch table, the review draft — must not live only there. Under a
+    real host tree the data dir sits in ``<host>/plugin-data/<plugin-id>``,
+    outside ``plugins/`` and outside every scanned workspace, so it
+    survives reinstalls untouched. Without a host tree (development
+    checkouts, unit tests) the plugin directory itself is the data dir,
+    which keeps the historical layout working.
+    """
+    host = _host_tree()
+    if host is None:
+        return PLUGIN_DIR
+    return host / "plugin-data" / PLUGIN_DIR.name
+
+
+def _config_source() -> tuple[Path, str] | None:
+    """(path, origin) of the active dispatch table, or None.
+
+    The plugin directory wins: a table the operator hand-placed next to
+    plugin.json is the explicit override. The plugin-data copy is what
+    makes the table survive an installer that rebuilds the plugin
+    directory — after a reinstall it is the copy that is found.
+    """
+    plugin_copy = PLUGIN_DIR / "routes.json"
+    if plugin_copy.is_file():
+        return plugin_copy, "plugin"
+    data_copy = _data_dir() / "routes.json"
+    if data_copy.is_file():
+        return data_copy, "data"
+    return None
+
+
+def _mirror_to_data_dir(plugin_copy: Path) -> None:
+    """Keep the plugin-data copy of the table in step with the plugin-dir one.
+
+    Runs after every reload of a plugin-dir table, so an operator's edits
+    never leave a stale rescue copy behind. Best-effort by design: an
+    unwritable data dir degrades to the old behavior (the table lives only
+    next to plugin.json and a reinstall wipes it), never to a broken guard.
+    """
+    data_copy = _data_dir() / "routes.json"
+    if data_copy == plugin_copy:
+        return
+    try:
+        if data_copy.is_file() and data_copy.read_bytes() == plugin_copy.read_bytes():
+            return
+        data_copy.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(plugin_copy, data_copy)
+        logger.info(
+            "dispatch-guard: mirrored routes.json into %s — that copy "
+            "survives plugin reinstalls",
+            data_copy,
+        )
+    except OSError:
+        logger.warning(
+            "dispatch-guard: could not mirror routes.json into %s; a plugin "
+            "reinstall will lose the table until the file is re-created",
+            data_copy,
+        )
+
+
 def _load_config() -> dict[str, Any]:
-    """Read routes.json, cached by mtime so mode flips apply without reload."""
-    path = PLUGIN_DIR / "routes.json"
+    """Read routes.json, cached by mtime so mode flips apply without reload.
+
+    The table is looked up in two homes: next to plugin.json (the explicit
+    override) and in the plugin-data dir (the copy that survives a
+    reinstall). A table found next to plugin.json is mirrored into the
+    data dir, so the next ``plugin install --force`` — which rebuilds the
+    plugin directory — finds it there instead of dropping the deployment
+    back to unconfigured.
+    """
+    source = _config_source()
+    if source is None:
+        _warn_unconfigured()
+        return {"mode": UNCONFIGURED, "routes": [], "ext_routes": {}}
+    path, origin = source
     try:
         mtime = path.stat().st_mtime
     except OSError:
         _warn_unconfigured()
         return {"mode": UNCONFIGURED, "routes": [], "ext_routes": {}}
-    if _CONFIG_CACHE["data"] is None or mtime != _CONFIG_CACHE["mtime"]:
+    if (
+        _CONFIG_CACHE["data"] is None
+        or mtime != _CONFIG_CACHE["mtime"]
+        or _CONFIG_CACHE["source"] != str(path)
+    ):
         try:
             # Normalize BEFORE committing to the cache: the cache must only
             # ever hold dicts the runtime can read, or a malformed rewrite
@@ -263,10 +344,13 @@ def _load_config() -> dict[str, Any]:
             data = _normalize_config(json.loads(path.read_text(encoding="utf-8")))
             _CONFIG_CACHE["data"] = data
             _CONFIG_CACHE["mtime"] = mtime
+            _CONFIG_CACHE["source"] = str(path)
             _lint_policy(data)
         except Exception:  # noqa: BLE001 - fail open
             logger.exception("dispatch-guard: bad routes.json, failing open")
             return {"mode": "off", "routes": [], "ext_routes": {}}
+        if origin == "plugin":
+            _mirror_to_data_dir(path)
     return _CONFIG_CACHE["data"]
 
 
@@ -640,18 +724,44 @@ def _draft_route_table(ws: str | Path) -> dict[str, Any] | None:
 def _maybe_write_draft(ws: str | Path) -> Path | None:
     """Draft routes.draft.json once per process; routes.json is never written.
 
-    The draft lands in warn mode and needs an explicit rename to take effect:
-    the operator confirms the mapping, the plugin does not activate itself.
+    The draft lives in the plugin-data dir so an installer that rebuilds
+    the plugin directory cannot lose it mid-review. An existing draft is
+    adopted, not regenerated — the operator may have edited it between
+    process starts. The draft lands in warn mode and needs an explicit
+    rename to take effect: the operator confirms the mapping, the plugin
+    does not activate itself.
     """
     global _DRAFT_WRITTEN
-    path = PLUGIN_DIR / "routes.draft.json"
+    path = _data_dir() / "routes.draft.json"
     if _DRAFT_WRITTEN:
         return path if path.exists() else None
     _DRAFT_WRITTEN = True
+    if not path.exists():
+        # Adopt before generating: a draft from a previous process (or a
+        # pre-migration one left in the plugin directory) carries operator
+        # edits the draft table must not overwrite.
+        legacy = PLUGIN_DIR / "routes.draft.json"
+        if legacy.is_file() and legacy != path:
+            try:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(legacy, path)
+                logger.info(
+                    "dispatch-guard: adopted routes.draft.json from the plugin "
+                    "directory into %s — that copy survives reinstalls",
+                    path.parent,
+                )
+            except OSError:
+                logger.exception(
+                    "dispatch-guard: could not migrate routes.draft.json into %s",
+                    path.parent,
+                )
+    if path.exists():
+        return path
     cfg = _draft_route_table(ws)
     if cfg is None:
         return None
     try:
+        path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(
             json.dumps(cfg, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
         )
@@ -659,8 +769,9 @@ def _maybe_write_draft(ws: str | Path) -> Path | None:
         logger.exception("dispatch-guard: could not write routes.draft.json")
         return None
     logger.info(
-        "dispatch-guard: drafted routes.draft.json from %d discovered agent(s); "
-        "review it and rename to routes.json to activate",
+        "dispatch-guard: drafted routes.draft.json (in %s) from %d discovered "
+        "agent(s); review it and rename to routes.json to activate",
+        path.parent,
         len(_discover_agents(ws)),
     )
     return path
@@ -835,10 +946,11 @@ class DispatchGuardMiddleware(MiddlewareBase):
     def _setup_hint(self, target: str) -> str:
         if self._draft_path is not None and self._draft_path.exists():
             return (
-                "[dispatch-guard 未配置] 插件目录下没有 routes.json。已按当前环境的专业 "
-                f"agent 生成草稿 {self._draft_path.name}（mode=warn，只观察不拦截）。"
+                "[dispatch-guard 未配置] 没有 routes.json。已按当前环境的专业 "
+                f"agent 生成草稿 {self._draft_path}（mode=warn，只观察不拦截）。"
                 "请和用户逐条确认草稿里的归属（ext_routes / 关键词 -> agent），"
-                "确认后把它改名为 routes.json 生效；观察一轮 warn 日志无误再切 enforce。"
+                "确认后把它改名为 routes.json 生效（留在原目录即可，该目录不受"
+                "插件重装影响）；观察一轮 warn 日志无误再切 enforce。"
                 f"目标：{target}"
             )
         return SETUP_HINT.format(target=target)

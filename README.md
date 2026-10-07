@@ -105,10 +105,12 @@ specialist agents and **drafts the table for you**:
 - **Where it looks:** `agents/*/agent.json` and top-level `agent.json` in the
   workspace, plus the host-level agents directory (`~/.qwenpaw/agents/`) when
   the plugin is installed under `~/.qwenpaw/plugins/`.
-- **What it writes:** `routes.draft.json` in the plugin directory, `mode` on
-  `warn`. Each deliverable category (documents, media, hardware artifacts,
-  archives) routes to the first discovered agent whose id/skills/description
-  mentions that category; categories with no matching agent stay unrouted.
+- **What it writes:** `routes.draft.json` in the plugin-data directory
+  (`~/.qwenpaw/plugin-data/dispatch-guard/` on a host install — a location a
+  plugin reinstall never touches), `mode` on `warn`. Each deliverable category
+  (documents, media, hardware artifacts, archives) routes to the first
+  discovered agent whose id/skills/description mentions that category;
+  categories with no matching agent stay unrouted.
 - **What it never does:** write `routes.json` itself or turn on `enforce`.
   Activation is an explicit rename.
 
@@ -208,7 +210,17 @@ non-whitelisted writes — is guarded. And the middleware attaches to the
 ## Configuration
 
 Copy `routes.example.json` to `routes.json` in the plugin directory and edit it.
-The sample uses placeholder agent ids; replace them with your own:
+The sample uses placeholder agent ids; replace them with your own. Where the
+table lives:
+
+- **Plugin directory** (`~/.qwenpaw/plugins/dispatch-guard/routes.json`) — the
+  explicit override, checked first. Convenient to edit, **but the host
+  installer rebuilds the plugin directory on every reinstall**, so the plugin
+  mirrors this copy into the plugin-data directory after every reload.
+- **Plugin-data directory** (`~/.qwenpaw/plugin-data/dispatch-guard/routes.json`)
+  — the durable home, checked second. After a reinstall this is the copy the
+  guard finds, so your table survives `qwenpaw plugin install --force`. Rename
+  the generated draft here and it activates.
 
 ```jsonc
 {
@@ -271,7 +283,8 @@ so sanitize before attaching one to an issue.
 
 - **Nothing is ever blocked and the log fills with `needs_config`.** Expected on
   a fresh install: there is no `routes.json`. Check the generated
-  `routes.draft.json`, review it with your agents' real duties, rename it to
+  `routes.draft.json` (plugin-data directory), review it with your agents' real
+  duties, rename it to
   `routes.json` (see [Quick start step 2](#2--configure-a-fresh-install-drafts-the-table-itself)).
 - **A deliverable write is never denied, and the log says `no_owner`.** The
   route names an agent that does not exist in this environment, or no

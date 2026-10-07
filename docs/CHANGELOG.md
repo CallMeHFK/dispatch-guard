@@ -1,5 +1,26 @@
 # Changelog
 
+## v0.1.9
+
+- **Your dispatch table now survives plugin reinstalls.** The host installer
+  rebuilds the plugin directory on every `plugin install --force` (rmtree +
+  copytree), which is how a v0.1.8 hot-upgrade silently dropped a deployment
+  back to `unconfigured` and destroyed an in-review draft. The plugin now
+  keeps private state in `<host>/plugin-data/dispatch-guard/`, a location the
+  installer never touches: the active table is looked up next to plugin.json
+  first (the explicit override) and in plugin-data second, a plugin-dir table
+  is mirrored into plugin-data after every reload (so operator edits never
+  leave a stale rescue copy), and after a reinstall the plugin-data copy is
+  what the guard finds.
+- `routes.draft.json` moved to the plugin-data directory for the same reason,
+  and an existing draft is now **adopted, not regenerated**: a draft from a
+  previous process — including pre-migration ones left in the plugin
+  directory — carries operator edits the draft table must not overwrite.
+  Development checkouts without a host tree keep the historical layout
+  (the plugin directory is its own data dir).
+- Setup hints and the onboarding docs name the actual draft path and the
+  two configuration homes.
+
 ## v0.1.8
 
 - **Path traversal can no longer dress a destination as something else.** When
