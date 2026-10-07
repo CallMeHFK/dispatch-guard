@@ -14,6 +14,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "backend"))
@@ -721,6 +722,189 @@ class DispatchGuardTest(unittest.TestCase):
         # that is an explicit target, not a mention.
         r = run(self.mw, "write_file", "outputs/report.docx")
         self.assertEqual(r[0].state, "denied")
+
+    # -- path traversal must not dress a destination as something else -------
+
+    def _host_plugin_tree(self, cfg_overrides=None):
+        """PLUGIN_DIR under <tmp>/host/plugins/: workspace escapes resolve far
+        away from PLUGIN_DIR.parent, so the traversal cases below judge the
+        real destination instead of colliding with the plugin-maintenance
+        whitelist (both plain tmpdirs share /tmp as a parent)."""
+        host = Path(self.plugin_tmp.name) / "host"
+        dg.PLUGIN_DIR = host / "plugins" / "dispatch-guard"
+        dg.PLUGIN_DIR.mkdir(parents=True, exist_ok=True)
+        cfg = json.loads((REPO / "routes.example.json").read_text(encoding="utf-8"))
+        cfg["mode"] = "enforce"
+        if cfg_overrides:
+            cfg.update(cfg_overrides)
+        (dg.PLUGIN_DIR / "routes.json").write_text(
+            json.dumps(cfg, ensure_ascii=False), encoding="utf-8"
+        )
+        self._bust_config_cache()
+
+    def test_traversal_escape_cannot_dress_as_whitelist(self):
+        # notes/../../outputs/escape.docx lands OUTSIDE the workspace; the raw
+        # spelling's "notes/" prefix must not whitelist the real destination.
+        self._host_plugin_tree()
+        r = run(self.mw, "write_file", {"file_path": "notes/../../outputs/escape.docx"})
+        self.assertEqual(r[0].state, "denied")
+        r = run(self.mw, "write_file", {"file_path": "tmp/../../../outputs/escape2.docx"})
+        self.assertEqual(r[0].state, "denied")
+
+    def test_traversal_escape_through_shell_is_seen(self):
+        self._host_plugin_tree({"shell_enforce": True})
+        r = run(
+            self.mw,
+            "execute_shell_command",
+            {"command": "echo x > notes/../../../outputs/e.docx"},
+        )
+        self.assertEqual(r[0].state, "denied")
+
+    def test_traversal_staying_inside_ws_is_normalized(self):
+        # notes/../outputs/inws.docx is the same file as outputs/inws.docx.
+        self._host_plugin_tree()
+        r = run(self.mw, "write_file", {"file_path": "notes/../outputs/inws.docx"})
+        self.assertEqual(r[0].state, "denied")
+
+    def test_traversal_escape_to_notes_is_not_a_deliverable(self):
+        # The reverse dressing: outputs/../../notes/x.md really lands in a
+        # notes directory outside the workspace — a basic operation that must
+        # not be denied nor audited as a deliverable.
+        self._host_plugin_tree()
+        r = run(self.mw, "write_file", {"file_path": "outputs/../../notes/x.md"})
+        self.assertEqual(r[0].content[0].text, "ok")
+        audit = Path(self.ws) / "logs" / "dispatch_guard.jsonl"
+        self.assertFalse(audit.exists())
+
+    def test_plugin_whitelist_survives_the_rel_rework(self):
+        self._host_plugin_tree()
+        r = run(self.mw, "write_file", {"file_path": str(dg.PLUGIN_DIR / "backend" / "main.py")})
+        self.assertEqual(r[0].content[0].text, "ok")
+
+    # -- malformed host config / routes.json must degrade, never crash -------
+
+    def test_host_config_wrong_shapes_exclude_nothing(self):
+        # config.json whose agents/profiles are the wrong JSON type used to
+        # raise AttributeError out of discovery and crash every guarded call.
+        host = Path(self.plugin_tmp.name) / "host"
+        dg.PLUGIN_DIR = host / "plugins" / "dispatch-guard"
+        dg.PLUGIN_DIR.mkdir(parents=True, exist_ok=True)
+        (host / "workspaces" / "DocAgent").mkdir(parents=True)
+        (host / "workspaces" / "DocAgent" / "agent.json").write_text(
+            json.dumps({"id": "DocAgent"}, ensure_ascii=False), encoding="utf-8"
+        )
+        for bad in (
+            '{"agents": null}',
+            '{"agents": []}',
+            '{"agents": {"profiles": []}}',
+            "{ not json",
+        ):
+            (host / "config.json").write_text(bad, encoding="utf-8")
+            self._bust_config_cache()
+            self.assertEqual(
+                {a["id"] for a in dg._discover_agents(self.ws)},
+                {"DocAgent"},
+                bad,
+            )
+
+    def test_wrong_typed_ext_routes_degrades_not_crashes(self):
+        # The first call failed open and every later call crashed with
+        # AttributeError: the poisoned cache outlived the load-time guard.
+        cfg = json.loads((REPO / "routes.example.json").read_text(encoding="utf-8"))
+        cfg["mode"] = "enforce"
+        cfg["ext_routes"] = ["oops"]
+        self.routes_path.write_text(json.dumps(cfg, ensure_ascii=False), encoding="utf-8")
+        self._bust_config_cache()
+        for _ in range(3):
+            r = run(self.mw, "write_file", {"file_path": "outputs/a.docx"})
+            self.assertEqual(r[0].state, "denied")
+
+    def test_wrong_typed_routes_and_null_ext_routes_degrade(self):
+        cfg = json.loads((REPO / "routes.example.json").read_text(encoding="utf-8"))
+        cfg["mode"] = "enforce"
+        cfg["routes"] = "abc"
+        cfg["ext_routes"] = None
+        self.routes_path.write_text(json.dumps(cfg, ensure_ascii=False), encoding="utf-8")
+        self._bust_config_cache()
+        for _ in range(2):
+            r = run(self.mw, "write_file", {"file_path": "outputs/a.docx"})
+            self.assertEqual(r[0].state, "denied")
+
+    def test_route_rule_with_non_array_match_keeps_other_rules(self):
+        cfg = json.loads((REPO / "routes.example.json").read_text(encoding="utf-8"))
+        cfg["mode"] = "enforce"
+        cfg["routes"] = [
+            {"match": "报告", "agent": "DocAgent"},
+            {"match": ["CI"], "agent": "CodeAgent"},
+        ]
+        self.routes_path.write_text(json.dumps(cfg, ensure_ascii=False), encoding="utf-8")
+        self._bust_config_cache()
+        self.assertEqual(self.mw._route_hit("outputs/CI-thing.md")[0], "CodeAgent")
+        self.assertEqual(self.mw._route_hit("outputs/x.md"), (None, None))
+
+    def test_non_object_routes_json_fails_open(self):
+        self._fresh_plugin_tree("[1, 2]")
+        self.assertEqual(dg._load_config()["mode"], "off")
+
+    # -- shell coverage: ffmpeg positional output, converter outdirs, globs --
+
+    def test_shell_ffmpeg_positional_output_is_seen(self):
+        # ffmpeg has no -o flag; its output is the trailing positional token.
+        r = run(self.mw, "execute_shell_command", {"command": "ffmpeg -i clip.mov clip.mp4"})
+        self.assertEqual(len(r[0].content), 2)
+        self.assertIn("dispatch-guard warn", r[0].content[1].text)
+
+    def test_shell_ffmpeg_probe_is_silent(self):
+        # "ffmpeg -i clip.mov" reads; the -i input must not pose as an output.
+        r = run(self.mw, "execute_shell_command", {"command": "ffmpeg -i clip.mov"})
+        self.assertEqual(len(r[0].content), 1)
+
+    def test_shell_ffmpeg_multi_input_last_token_is_output(self):
+        r = run(self.mw, "execute_shell_command", {"command": "ffmpeg -y -i a.mov -i b.mov out.mp4"})
+        self.assertEqual(len(r[0].content), 2)
+
+    def test_shell_converter_outdir_is_seen(self):
+        r = run(self.mw, "execute_shell_command", {
+            "command": "soffice --headless --convert-to docx --outdir outputs report.odt"
+        })
+        self.assertEqual(len(r[0].content), 2)
+
+    def test_deliverable_directory_itself_is_a_target(self):
+        r = run(self.mw, "execute_shell_command", {"command": "soffice --outdir=outputs/ x.odt"})
+        self.assertEqual(len(r[0].content), 2)
+
+    def test_shell_glob_mention_is_silent(self):
+        # '*.docx' names a class of files, not a deliverable target.
+        r = run(self.mw, "execute_shell_command", {"command": "find . -name '*.docx'"})
+        self.assertEqual(len(r[0].content), 1)
+
+    # -- draft policy parsing: every claim, across sentences and phrasings ---
+
+    def test_policy_claims_across_sentences_and_pai_gei(self):
+        # "。" is a sentence boundary the old parser swallowed, and "派给 X"
+        # is a phrasing it never matched — both lost whole routing claims.
+        self._make_agents({"DocAgent": ["文档"], "DesignAgent": ["图形"]})
+        self._write_default_manifest("文档派 DocAgent。图形派给 DesignAgent")
+        cfg = dg._draft_route_table(self.ws)
+        self.assertIsNotNone(cfg)
+        self.assertEqual(cfg["ext_routes"][".docx"], "DocAgent")
+        self.assertEqual(cfg["ext_routes"][".png"], "DesignAgent")
+
+    # -- discovery resilience -------------------------------------------------
+
+    def test_failed_discovery_is_not_cached(self):
+        # A transient read error used to cache a PARTIAL inventory keyed to
+        # the unchanged stamp — never retried, inventing no_owner verdicts.
+        self._make_agents({"DocAgent": ["文档"]})
+        bad_root = mock.MagicMock()
+        bad_root.is_dir.return_value = True
+        bad_root.glob.side_effect = OSError(5, "Injected I/O error")
+        with mock.patch.object(
+            dg, "_discovery_roots", return_value=[Path(self.ws) / "agents", bad_root]
+        ):
+            agents = dg._discover_agents(self.ws)
+        self.assertEqual([a["id"] for a in agents], ["DocAgent"])
+        self.assertIsNone(dg._AGENTS_CACHE["agents"], "partial inventory must not be cached")
 
 
 if __name__ == "__main__":

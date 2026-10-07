@@ -60,6 +60,22 @@ class AuditSummaryTest(unittest.TestCase):
         self.assertIn("outputs/poster.svg", report)
         self.assertIn("DocAgent", report)
 
+    def test_generic_hint_names_no_agent(self):
+        # When discovery is empty the deny names the placeholder "对应专业
+        # agent" — that string is not an agent and must not appear as one.
+        records = [
+            {
+                "ts": 8,
+                "action": "denied",
+                "mode": "enforce",
+                "target": "outputs/a.docx",
+                "message": "该产出属于 对应专业 agent 域（命中 交付物路径），请用 submit_to_agent "
+                "派发给 对应专业 agent；如确属编排/元操作，请与用户确认后加入白名单。目标：outputs/a.docx",
+            }
+        ]
+        s = audit_summary.summarize(records)
+        self.assertEqual(s["denied_by_agent"], {})
+
 
 if __name__ == "__main__":
     unittest.main()
