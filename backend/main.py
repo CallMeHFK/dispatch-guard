@@ -140,6 +140,13 @@ WHITELIST_FILES = {
     "agent.json",
 }
 
+# The guard's own dispatch tables (both live copies). A write to either of
+# these reconfigures — or silently disables — the guard itself, so the
+# guarded agent must never touch them: excluded from every whitelist and
+# denied outright by the write-tools branch, in every mode the middleware
+# observes (D1 — meta-integrity, not deliverable routing).
+_GUARD_CONFIG_NAMES = frozenset({"routes.json", "routes.draft.json"})
+
 # Command-line shapes that name an output FILE (redirect, tee, a converter's
 # -o, or the destination of cp/mv/rsync/install). Whether that file is a
 # deliverable is decided by _is_deliverable(), not here — so a redirect into
@@ -295,6 +302,22 @@ def _mirror_to_data_dir(plugin_copy: Path) -> None:
     if data_copy == plugin_copy:
         return
     try:
+        # Defense in depth (D1): only a table that parses as a JSON object and
+        # survives normalization + lint may propagate into the reinstall-proof
+        # home. _load_config already guarantees that ordering at its call site;
+        # this gate keeps any future caller honest too.
+        try:
+            parsed = json.loads(plugin_copy.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            parsed = None
+        if not isinstance(parsed, dict):
+            logger.warning(
+                "dispatch-guard: plugin-dir routes.json is not a parseable "
+                "JSON object; refusing to mirror it into %s",
+                data_copy,
+            )
+            return
+        _lint_policy(_normalize_config(parsed))
         if data_copy.is_file() and data_copy.read_bytes() == plugin_copy.read_bytes():
             return
         data_copy.parent.mkdir(parents=True, exist_ok=True)
@@ -884,6 +907,9 @@ class DispatchGuardMiddleware(MiddlewareBase):
             return True
         if any(rel.startswith(d) for d in WHITELIST_DIRS):
             return True
+        if Path(rel).name in _GUARD_CONFIG_NAMES:
+            # 守卫自身路由表永不白名单（D1）：default 不得改写自己的枷锁。
+            return False
         # 插件本体目录 = default 的架构维护区，非交付物。
         # 只对原本就是绝对路径的目标生效：rel 相对路径是工作区相对的，
         # 按 cwd resolve 会误判（仓库恰好在 PLUGIN_DIR.parent 下时全白名单）。
@@ -894,6 +920,31 @@ class DispatchGuardMiddleware(MiddlewareBase):
                 return True
             except (ValueError, OSError):
                 return False
+        return False
+
+    def _is_guard_config(self, target: str) -> bool:
+        """True when the target is one of the guard's own dispatch tables.
+
+        Both live locations count: the plugin directory (explicit override)
+        and the plugin-data directory (the reinstall-proof copy). Symlinks
+        are resolved so a crafted path cannot dress the table as something
+        else (D1).
+        """
+        if Path(target).name not in _GUARD_CONFIG_NAMES:
+            return False
+        p = Path(self._rel(target))
+        if not p.is_absolute():
+            p = self._ws / p
+        try:
+            rp = p.resolve()
+        except (OSError, ValueError, RuntimeError):
+            rp = Path(os.path.normpath(str(p)))
+        for root in (PLUGIN_DIR, _data_dir()):
+            try:
+                rp.relative_to(root.resolve())
+                return True
+            except (ValueError, OSError):
+                continue
         return False
 
     def _is_deliverable(self, rel: str, cfg: dict[str, Any]) -> bool:
@@ -1136,6 +1187,16 @@ class DispatchGuardMiddleware(MiddlewareBase):
             return
 
         if name in _write_tools(cfg):
+            if target_is_path and self._is_guard_config(target):
+                yield self._deny(
+                    f"dispatch-guard 元完整性：{Path(str(target)).name} 是本守卫的"
+                    "路由配置，agent 一律不得写改（D1）；配置变更请由操作员在"
+                    "会话外完成。",
+                    name,
+                    self._rel(target),
+                    mode,
+                )
+                return
             # Whitelisted bookkeeping writes and every non-deliverable write
             # (notes, scripts, configs, scratch, extension-less files) are
             # basic operations: they pass untouched in every mode, without a
