@@ -183,9 +183,19 @@ SHELL_OUTPUT_PATTERNS = (
         r"|-[oO])(?:=|\s+)([^\s;&|]+)",
         re.I,
     ),
+    # The same short flags with the value joined instead of separated:
+    # curl -ooutputs/a.docx, wget -Oout.docx (B6). Its own alternative so
+    # the separated form above stays exactly as it was; the lookahead
+    # requires a joined value, so a bare "-o" at the end of a command and
+    # the "-o FILE" spelling are left to the pattern above.
+    re.compile(r"(?:^|[\s;&|])-[oO](?=[^\s;&|=])([^\s;&|]+)", re.I),
     # Compilers also accept the joined form: gcc -ooutputs/prog.exe (D7).
+    # The trailing test is (?!\w) rather than \b: after "g++" the next
+    # character is a space and the previous one is "+", and two non-word
+    # characters make no boundary, so \b silently excluded every compiler
+    # whose name ends in "++" (B6).
     re.compile(
-        r"\b(?:gcc|g\+\+|clang|clang\+\+|cc|c\+\+)\b[^;&|]*?[\s;]"
+        r"\b(?:clang\+\+|clang|g\+\+|gcc|c\+\+|cc)(?!\w)[^;&|]*?[\s;]"
         r"-o(?=[^\s;&|])([^\s;&|]+)",
         re.I,
     ),
@@ -198,6 +208,15 @@ SHELL_OUTPUT_PATTERNS = (
     re.compile(
         r"\btar\b(?:\s+[^;&|\s]+)*?\s+(?:-{1,2})?[a-zA-Z]*c[a-zA-Z]*f[a-zA-Z]*"
         r"(?:\s+|=)([^\s;&|]+)",
+        re.I,
+    ),
+    # tar's long-option spelling (B6): --create with --file[=]ARCHIVE, in
+    # either order. The lookahead asserts create-semantics somewhere in the
+    # same segment, so --list / --extract / -t stay inputs and are not
+    # mistaken for an archive being written.
+    re.compile(
+        r"\btar\b(?=[^;&|]*--create)[^;&|]*?(?:--file|-f)(?:=|\s+)"
+        r"([^\s;&|]+)",
         re.I,
     ),
     re.compile(r"\b(?:cp|mv|rsync|install)\b[^;&|]*\s+([^\s;&|]+)", re.I),

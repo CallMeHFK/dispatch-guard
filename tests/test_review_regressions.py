@@ -334,6 +334,54 @@ class ReviewRegressionTest(unittest.TestCase):
                 self.assertNotEqual(r[0].state, "denied")
                 self.assertEqual(len(r[0].content), 1, f"no warn block for {cmd!r}")
 
+    def test_shell_joined_and_long_option_outputs_are_seen(self):
+        # B6: three shapes the D7 patterns still missed.
+        #   - a short output flag with its value joined: curl -oFILE. The
+        #     generic flag pattern required "=" or whitespace after the flag.
+        #   - the same joined form on a compiler whose name ends in "+": the
+        #     compiler pattern's trailing \b never matched after "g++" (two
+        #     non-word characters make no boundary), so only gcc/cc/clang were
+        #     covered and g++ slipped through.
+        #   - tar's long-option spelling: --create --file=ARCHIVE, which the
+        #     short-bundle pattern ([a-zA-Z]*c[a-zA-Z]*f) cannot spell.
+        variants = [
+            "curl -ooutputs/a.docx https://x/y",
+            "curl -Ooutputs/a.docx https://x/y",
+            "wget -Ooutputs/a.docx https://x/y",
+            "g++ -ooutputs/prog.exe main.cpp",
+            "clang++ -ooutputs/prog.exe main.cpp",
+            "tar --create --file=outputs/b.tgz src/",
+            "tar --create --file outputs/b.tgz src/",
+            "tar --file=outputs/b.tgz --create src/",
+        ]
+        for cmd in variants:
+            with self.subTest(cmd=cmd):
+                self._write_config(dict(self._SHELL_ENFORCE_CFG))
+                r = run(self.mw, "execute_shell_command", {"command": cmd})
+                self.assertEqual(r[0].state, "denied")
+
+    def test_shell_non_create_and_or_operator_are_not_denied(self):
+        # B6 negative controls: listing, extracting and find's -o operator
+        # are not writes, and a bare non-deliverable -o target is not a
+        # deliverable. A mention-level warn is acceptable here — a deny is
+        # not, and neither is a new explicit-target match.
+        variants = [
+            "tar tf outputs/b.tgz",
+            "tar --list --file=outputs/b.tgz",
+            "tar xf outputs/b.tgz -C /tmp",
+            "tar --extract --file=outputs/b.tgz",
+            "find . -name '*.docx' -o -name '*.pdf'",
+            "ls outputs",
+            "cat outputs/a.docx",
+            "curl -o /tmp/plain https://x/y",
+            "g++ -c main.cpp",
+        ]
+        for cmd in variants:
+            with self.subTest(cmd=cmd):
+                self._write_config(dict(self._SHELL_ENFORCE_CFG))
+                r = run(self.mw, "execute_shell_command", {"command": cmd})
+                self.assertNotEqual(r[0].state, "denied")
+
     # -- D9: trailing-dot / trailing-space ext perturbation ------------------
 
     def test_perturbed_ext_still_routes(self):
