@@ -494,6 +494,11 @@ def ask(
             # the tier's error already says why — marking every question
             # "malformed" on top would be noise, and would bury "timeout".)
             for key, question in pending.items():
+                if key not in answers:
+                    # A judge may answer fewer questions than asked — the rest
+                    # cascade (or fall back), they are not malformed.
+                    still[key] = question
+                    continue
                 verdict = _parse_choice(
                     answers.get(key),
                     [str(o) for o in question.get("criteria", {})],
