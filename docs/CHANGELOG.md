@@ -1,14 +1,17 @@
 # Changelog
 
-## Unreleased — v0.1.9 评审修复 (review-20261012)
+<!-- The top section is deliberately not a `## vX.Y.Z` heading.
+     tests/test_release_hygiene.py requires the newest versioned section to
+     equal plugin.json's version, and the version bump was deferred to the
+     maintainer, so a versioned heading here would fail that gate.
+     packaging/release_notes.py can only address a versioned section: when this
+     ships, rename the heading to `## vX.Y.Z`, bump plugin.json in the same
+     change — which is what CONTRIBUTING asks for and what the hygiene test
+     enforces — and delete this comment. It lives above the first heading
+     because extract() takes everything below a heading up to the next one, so
+     a note inside the section would ship inside the release page. -->
 
-<!-- Not a `## vX.Y.Z` heading on purpose. tests/test_release_hygiene.py
-     requires the newest versioned section to equal plugin.json's version, and
-     the version bump was deferred to the maintainer, so a versioned heading
-     here would fail that gate. packaging/release_notes.py can only address a
-     versioned section: when this ships, rename the heading to `## vX.Y.Z` and
-     bump plugin.json in the same change, which is what CONTRIBUTING asks for
-     and what the hygiene test enforces. -->
+## Unreleased — v0.1.9 评审修复 (review-20261012)
 
 Adversarial review 2026-10-12 (`review-20261012.md`) found 17 defects
 (D1–D17) plus fail-open consistency items (F1–F18). Every fix landed on
