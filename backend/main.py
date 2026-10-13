@@ -580,8 +580,20 @@ def _canonical_target(p: str) -> str:
     on every filesystem that matters here, and an ext-only routes table
     must not stand down because of one stray dot. Display and audit keep
     the original string; only the judgment form is canonicalized.
+
+    Removed to a fixed point, not one pass each way. Dots and whitespace
+    alternate at the end of a spelling, and a single ``strip().rstrip(".")``
+    only ever peels one layer: ``"report.docx ."`` ends in a dot, so strip
+    finds nothing to do and rstrip leaves ``"report.docx "`` — an extension
+    with a trailing space, which matched no route and produced no audit
+    record at all. Loop until the string stops changing.
     """
-    return p.strip().rstrip(".")
+    text = p
+    while True:
+        peeled = text.strip().rstrip(".")
+        if peeled == text:
+            return peeled
+        text = peeled
 
 
 # D10: the spawn backstop's denial record used to carry the tool input
@@ -1120,7 +1132,11 @@ class DispatchGuardMiddleware(MiddlewareBase):
         # both get the whitelist's benefit; on a case-insensitive host the
         # same file now gets one answer. The plugin-tree containment check
         # below stays case-sensitive: it resolves real paths, not prefixes.
-        key = rel.replace("\\", "/").lower()
+        # Canonicalised for the same reason (B5): _is_deliverable peels
+        # trailing dots and spaces before judging, so a spelling accident
+        # must not make the two halves of one decision disagree about which
+        # string they are looking at.
+        key = _canonical_target(rel).replace("\\", "/").lower()
         if key in {f.lower() for f in WHITELIST_FILES}:
             return True
         if any(key.startswith(d) for d in WHITELIST_DIRS):

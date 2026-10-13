@@ -543,6 +543,53 @@ class ReviewRegressionTest(unittest.TestCase):
         self.assertNotIn(secret, text)
         self.assertIn("sha256:", text)
 
+    # -- B5 (Phase 3): canonicalisation ran strip() once and rstrip(".") once,
+    #    in that order. A spelling that ends in a dot defeats strip(), so
+    #    "report.docx ." came out as "report.docx " — an extension with a
+    #    trailing space, which matched no route and left no audit record.
+
+    def test_canonical_target_is_a_fixed_point(self):
+        cases = {
+            "report.docx": "report.docx",
+            "report.docx.": "report.docx",
+            "report.docx ": "report.docx",
+            "report.docx .": "report.docx",
+            "report.docx. ": "report.docx",
+            "a.docx . .": "a.docx",
+            "outputs/a.docx .": "outputs/a.docx",
+            "report.docx\xa0": "report.docx",
+        }
+        for raw, want in cases.items():
+            with self.subTest(raw=raw):
+                self.assertEqual(dg._canonical_target(raw), want)
+
+    def test_trailing_space_then_dot_is_not_a_bypass(self):
+        log = Path(self.ws) / "logs" / "dispatch_guard.jsonl"
+        for raw in ("report.docx .", "outputs/a.docx .", "a.docx . ."):
+            with self.subTest(target=raw):
+                if log.exists():
+                    log.unlink()
+                r = run(self.mw, "write_file", {"file_path": raw, "content": "x"})
+                self.assertEqual(r[0].state, "denied")
+                # The failure mode this guards is silence, not just a pass:
+                # a target that stops looking deliverable produces no record
+                # at all, so the operator never learns the write happened.
+                self.assertTrue(log.exists(), "denial left no audit record")
+                self.assertIn("denied", log.read_text(encoding="utf-8"))
+
+    def test_whitelist_uses_the_same_canonical_yardstick(self):
+        # D12 made the whitelist case-insensitive so one spelling of a path
+        # gets one answer. Trailing dots and spaces are the same class of
+        # spelling accident: _is_deliverable canonicalises, so _whitelisted
+        # must too, or the two halves of the decision disagree about what
+        # string they are judging.
+        for raw in ("MEMORY.md", "MEMORY.md.", "MEMORY.md ", "MEMORY.md ."):
+            with self.subTest(target=raw):
+                self.assertTrue(dg.DispatchGuardMiddleware._whitelisted(raw))
+        for raw in ("outputs/a.docx", "outputs/a.docx ."):
+            with self.subTest(target=raw):
+                self.assertFalse(dg.DispatchGuardMiddleware._whitelisted(raw))
+
 
 if __name__ == "__main__":
     unittest.main()
