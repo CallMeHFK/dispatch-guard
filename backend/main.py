@@ -84,6 +84,40 @@ logger = logging.getLogger("dispatch_guard.qwenpaw")
 
 PLUGIN_DIR = Path(__file__).resolve().parent.parent
 
+
+def _load_jev():
+    """The optional jev arbitration layer (backend/jev.py), or None.
+
+    Sibling-module import: the plugin loader hands QwenPaw this file by path,
+    so a plain ``import jev`` only resolves where backend/ sits on sys.path
+    (the test suite). Loading by file location works under both. A failure
+    here must never disarm the guard — None degrades the whole jev layer to
+    off, which is the fail-open rule applied to the hook itself.
+    """
+    try:
+        import jev
+
+        return jev
+    except ImportError:
+        pass
+    try:
+        import importlib.util
+
+        spec = importlib.util.spec_from_file_location(
+            "dispatch_guard_jev", Path(__file__).with_name("jev.py")
+        )
+        if spec is None or spec.loader is None:
+            return None
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+    except Exception:  # noqa: BLE001
+        logger.exception("dispatch-guard: could not load the jev layer; it stays off")
+        return None
+
+
+_jev = _load_jev()
+
 # Audit trail rotation threshold: roll dispatch_guard.jsonl into a single
 # .jsonl.1 backup when it exceeds this size.
 AUDIT_MAX_BYTES = 1 << 20
@@ -1041,22 +1075,86 @@ def _dispatch_policy(ws: str | Path, agents: list[dict[str, Any]]) -> list[tuple
     return policy
 
 
-def _draft_route_table(ws: str | Path) -> dict[str, Any] | None:
+def _jev_draft_verdicts(
+    agents: list[dict[str, Any]], jev_audit: list[dict[str, Any]] | None
+) -> dict[str, dict[str, Any]]:
+    """P0 jev hook: one judge call answering "who owns category qi?" per
+    _DRAFT_PRESETS entry, or {} when the layer is off/unavailable.
+
+    Sits strictly between the orchestrator's declared policy (which always
+    wins) and the keyword blob scan (which stays the fallback): a judge
+    verdict that is uncertain, unanswered, or names anything but a live
+    agent id is ignored and the category falls through to the scan. Any
+    failure inside the layer — the call runs under the guard's fail-open
+    rule — degrades to the same scan, so a dead judge can never wedge a
+    fresh install's onboarding.
+    """
+    if _jev is None:
+        return {}
+    try:
+        runtime, reason, record = _jev.resolve(_load_config(), PLUGIN_DIR)
+        if runtime is None:
+            if reason is not None and record and jev_audit is not None:
+                jev_audit.append(
+                    {
+                        "judge": None,
+                        "latencyMs": 0.0,
+                        "probability": {},
+                        "value": {},
+                        "fallback": reason,
+                    }
+                )
+            return {}
+        state, questions = _jev.category_questions(agents, _DRAFT_PRESETS)
+        verdicts, call_audit = _jev.ask(runtime, state, questions)
+        if record and jev_audit is not None:
+            jev_audit.append(
+                {
+                    "judge": call_audit["judge"],
+                    "latencyMs": call_audit["latencyMs"],
+                    "probability": {k: v["probability"] for k, v in verdicts.items()},
+                    "value": {k: v["value"] for k, v in verdicts.items()},
+                    "fallback": ";".join(
+                        sorted({v["fallback"] for v in verdicts.values() if v["fallback"]})
+                    ),
+                }
+            )
+        return verdicts
+    except Exception:  # noqa: BLE001 - the hook fails open to the keyword scan
+        logger.exception(
+            "dispatch-guard: jev draft hook failed; falling back to the keyword scan"
+        )
+        return {}
+
+
+def _draft_route_table(
+    ws: str | Path, jev_audit: list[dict[str, Any]] | None = None
+) -> dict[str, Any] | None:
     """Map discovered agents onto deliverable categories, or None if vacuous.
 
     Routing follows the environment's own declared intent first: the
     orchestrator's "X派Y" policy (parsed from its agent.json description)
-    decides each category. Only when no policy is parseable does the draft
-    fall back to guessing from agent ids/skills/descriptions — a terse
-    manifest scan invents ownership that the deployment never stated.
+    decides each category. When no policy is parseable and the jev layer is
+    enabled, a local judge picks the owner per category; only its certain,
+    live-agent answers count. Anything else — no policy, jev off, judge
+    dead or unsure — falls back to guessing from agent
+    ids/skills/descriptions, a terse manifest scan that would otherwise
+    invent ownership the deployment never stated.
+
+    ``jev_audit`` (optional) collects the layer's decision records for the
+    caller to write into the audit trail.
     """
     agents, _readable = _discover_agents(ws)
     if not agents:
         return None
     cfg: dict[str, Any] = {"mode": "warn", "routes": [], "ext_routes": {}}
     policy = _dispatch_policy(ws, agents)
+    jev_verdicts: dict[str, dict[str, Any]] = {}
+    if not policy:
+        jev_verdicts = _jev_draft_verdicts(agents, jev_audit)
+    agent_ids = {a["id"] for a in agents}
     routed = False
-    for preset in _DRAFT_PRESETS:
+    for index, preset in enumerate(_DRAFT_PRESETS):
         owner = None
         if policy:
             lowered = [(token.lower(), agent_id) for token, agent_id in policy]
@@ -1069,13 +1167,23 @@ def _draft_route_table(ws: str | Path) -> dict[str, Any] | None:
                 if owner:
                     break
         else:
-            for agent in agents:
-                blob = " ".join(
-                    [agent["id"], *agent["skills"], agent["description"]]
-                ).lower()
-                if any(t.lower() in blob for t in preset["match"]):
-                    owner = agent["id"]
-                    break
+            verdict = jev_verdicts.get(f"q{index}")
+            if (
+                verdict is not None
+                and not verdict["uncertain"]
+                and not verdict["fallback"]
+                and verdict["value"] in agent_ids
+            ):
+                # 选中 "unrouted" 或置信不足都不是归属——回落关键词扫描。
+                owner = verdict["value"]
+            else:
+                for agent in agents:
+                    blob = " ".join(
+                        [agent["id"], *agent["skills"], agent["description"]]
+                    ).lower()
+                    if any(t.lower() in blob for t in preset["match"]):
+                        owner = agent["id"]
+                        break
         if owner:
             cfg["ext_routes"].update({ext: owner for ext in preset["exts"]})
             cfg["routes"].append({"match": list(preset["match"]), "agent": owner})
@@ -1083,7 +1191,9 @@ def _draft_route_table(ws: str | Path) -> dict[str, Any] | None:
     return cfg if routed else None
 
 
-def _maybe_write_draft(ws: str | Path) -> Path | None:
+def _maybe_write_draft(
+    ws: str | Path, log: Callable[..., None] | None = None
+) -> Path | None:
     """Draft routes.draft.json once per process; routes.json is never written.
 
     The draft lives in the plugin-data dir so an installer that rebuilds
@@ -1092,6 +1202,10 @@ def _maybe_write_draft(ws: str | Path) -> Path | None:
     process starts. The draft lands in warn mode and needs an explicit
     rename to take effect: the operator confirms the mapping, the plugin
     does not activate itself.
+
+    ``log`` (the middleware's audit writer) receives the jev layer's
+    decision record when the layer participated in the draft — including
+    its fallback reason when it was configured but could not run.
     """
     global _DRAFT_WRITTEN
     path = _data_dir() / "routes.draft.json"
@@ -1119,7 +1233,20 @@ def _maybe_write_draft(ws: str | Path) -> Path | None:
                 )
     if path.exists():
         return path
-    cfg = _draft_route_table(ws)
+    jev_audit: list[dict[str, Any]] = []
+    cfg = _draft_route_table(ws, jev_audit=jev_audit)
+    if jev_audit and log is not None:
+        for entry in jev_audit:
+            log(
+                {
+                    "action": "draft",
+                    "tool": "",
+                    "target": str(path),
+                    "mode": "warn",
+                    "jev": entry,
+                    "message": "jev layer participated in drafting routes.draft.json",
+                }
+            )
     if cfg is None:
         return None
     try:
@@ -2025,7 +2152,7 @@ def _factory(ctx: Any, agent_config: Any) -> DispatchGuardMiddleware | None:
         # Fresh install: look around before asking anyone to configure — a
         # draft table from the real agent inventory is the reviewable version
         # of "build a dispatch table with the user".
-        mw._draft_path = _maybe_write_draft(workspace_dir)
+        mw._draft_path = _maybe_write_draft(workspace_dir, log=mw._log)
     return mw
 
 
