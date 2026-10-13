@@ -1,5 +1,83 @@
 # Changelog
 
+## Unreleased — v0.1.9 评审修复 (review-20261012)
+
+Adversarial review 2026-10-12 (`review-20261012.md`) found 17 defects
+(D1–D17) plus fail-open consistency items (F1–F18). Every fix landed on
+`fix/review-20261012`; the review's 12-case evidence pack now passes 12/12,
+and the repository suite covers every finding with targeted regression tests.
+
+- **D1 (Blocker) — the guarded agent can no longer rewrite its own dispatch
+  table.** `routes.json`/`routes.draft.json` basenames are excluded from
+  every whitelist (the plugin tree included), writes to either home are
+  denied in every mode, and only lint-clean tables mirror into plugin-data.
+  Extended to the shell arm (D1-shell): a command whose text mentions the
+  guard's tables is intercepted at mention level — denied under enforce,
+  warned in every other observed mode.
+- **D2 — dict-shaped `tool_call` no longer disarms the guard.** `on_acting`
+  accepts Mapping-shaped calls; an unrecognizable shape is audited and
+  spawn-suspect payloads are refused under the most conservative reading.
+- **D3 — non-string `file_path` values (list/dict) are no longer str()-coerced
+  into silent passes.** They route through the full-field scan; a deliverable
+  inside them is treated as an explicit target.
+- **D4 — `"match": null` degrades instead of crashing.** Normalization coerces
+  null/non-list `match` to `[]` and members to strings; `_route_hit` skips
+  non-strings. Per the ruling: a null-match rule owns nothing, so such a
+  table passes writes with `no_owner` records rather than denying them.
+- **D5 — a malformed agent manifest (int/bool `skills`) degrades to that
+  agent not existing** instead of crashing every deliverable interception.
+- **D6 — shell redirects `>|` (noclobber) and `tee` long options
+  (`--append`) are visible targets.**
+- **D7 — downloader/archiver/compiler/in-place-editor outputs are covered**:
+  `curl -o/-O`, `wget -O`/`--output-document`, `dd of=`, `zip`/`tar`
+  creation (dash-free `tar czf` included), `gcc`/`clang` `-o` in split and
+  joined form, generic `--outdir`/`--output`, and `sed`/`perl -i` rewriting
+  their trailing file argument. Read shapes (`tar xf`, `sed -n`,
+  `ffmpeg -i`) stay silent.
+- **D8 — zero-agent environments now match the documented promise.** A
+  readable-but-empty inventory is a genuine single-agent deployment: every
+  class is `no_owner`, writes pass with an audit record. Only a failed
+  discovery walk keeps trusting the operator's table. Deny text never
+  points at an invented "对应专业 agent" — an unresolvable owner is handed
+  back to the user.
+- **D9 — extension perturbation cannot erase routing.** Trailing dots and
+  whitespace are canonicalized before deliverable and route decisions:
+  `report.docx.` routes as `report.docx`.
+- **D10 — spawn denial audit records are digests**: sha256[:16] + length + a
+  credential-redacted excerpt (`sk-*`, token/secret/password assignments).
+  Verbatim task text no longer reaches the jsonl.
+- **D11 — a legitimate path key no longer closes the scan of the rest of the
+  input.** Deliverables hidden in other arguments earn a mention-level
+  warning (never a deny from that tier).
+- **D12 — one yardstick for whitelist and deliverable judgment**: both
+  case-insensitive, matching `_is_deliverable`'s lowercasing; `Notes/x.docx`
+  is no longer denied where `notes/x.docx` passes.
+- **D13 — a parse failure keeps the last known-good table** with a loud
+  warning instead of silently disarming; only a cold cache with nothing
+  good ever loaded fails open to `off`.
+- **D14 — `mode=off` no longer detaches the middleware.** The factory
+  always attaches; off short-circuits inside `on_acting`, so an
+  off→enforce flip hot-applies like every other flip, and each disarmed
+  period is marked by one `action=off` audit record.
+- **D15 — a missing `routes` key is a legal minimal config**, not a type
+  error; the wrong-type warning fires only on an explicit null or wrong
+  type.
+- **D16 — non-string `deliverable_dirs` members are dropped with a warning**
+  instead of `str()`-coercing into invented `none/` / `5/` directories.
+- **D17 — the private-payload check matches table basenames at any directory
+  depth**: `backend/routes.json` or `sub/routes.draft.json` in the candidate
+  set can no longer slip into the published archive.
+- **F17 — a guard-internal exception never bubbles out of the middleware**:
+  it is host-logged, audited, and failed open with a visible warning block
+  (the never-wedge rule), and a tool whose response already started is
+  never re-run.
+- Documentation synced to the implementation (README, plugin.json
+  `meta.notes`): off semantics and hot-reload, the shell coverage families,
+  the no-owner rule, last-known-good fail-open, case-insensitive matching,
+  and audit redaction. `docs/DESIGN.md` was not in the adjudicated file
+  scope for this branch; its stale root-`.pdf` claim (§8.3 item 1) remains
+  open.
+
 ## v0.1.9
 
 - **Your dispatch table now survives plugin reinstalls.** The host installer
