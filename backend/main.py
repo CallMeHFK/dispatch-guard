@@ -167,11 +167,31 @@ _GUARD_CONFIG_NAMES = frozenset({"routes.json", "routes.draft.json"})
 # that already names the guard's own table — because past that point the
 # command has no innocent reading left.
 _GUARD_TABLE_MUTATE_RE = re.compile(
-    r"(?:^|[\s;&|(])(?:rm|mv|truncate|unlink|shred|dd|chmod|chown)(?!\w)"
+    r"(?:^|[\s;&|(])(?:rm|mv|truncate|unlink|shred|dd|chmod|chown|ln)(?!\w)"
     r"|\bopen\s*\([^)]*['\"][wax]"
     r"|\.write\s*\(",
     re.I,
 )
+
+# `cd <dir>` in a shell command changes what a bare relative path means for
+# the rest of the line. Scoped use: if the destination IS one of the guard's
+# two homes, a bare routes.json later in the command is the guard's table.
+_CD_INTO_RE = re.compile(
+    r"(?:^|[\s;&|(])cd\s+(?:-{1,2}[\w-]+\s+)*"
+    r"(\"[^\"]+\"|'[^']+'|[^\s;&|]+)",
+    re.I,
+)
+
+# A bare basename only counts after such a cd, and only at a path boundary —
+# routes.json.bak is a backup and routes.json5 is another file.
+_BARE_GUARD_BASENAME_RE = re.compile(
+    r"(?:^|[\s;&|('\"`])(routes\.draft\.json|routes\.json)(?![\w.-])",
+    re.I,
+)
+
+# Characters that continue a path spelling: \w (the command is lowercased
+# before comparison) plus "." and "-". Anything else ends the spelling.
+_PATH_CONT_CHARS = frozenset("abcdefghijklmnopqrstuvwxyz0123456789_.-")
 
 # Command-line shapes that name an output FILE (redirect, tee, an output
 # flag, or the destination of cp/mv/rsync/install). Whether that file is a
@@ -1248,7 +1268,18 @@ class DispatchGuardMiddleware(MiddlewareBase):
                 return False
         return False
 
-    def _is_guard_config(self, target: str) -> bool:
+    @staticmethod
+    def _guard_home_dirs() -> tuple[Path, ...]:
+        """The guard's two table homes, resolved (D1)."""
+        out = []
+        for root in (PLUGIN_DIR, _data_dir()):
+            try:
+                out.append(root.resolve())
+            except (OSError, ValueError, RuntimeError):
+                out.append(Path(os.path.normpath(str(root))))
+        return tuple(out)
+
+    def _is_guard_config(self, target: str, base: Path | None = None) -> bool:
         """True when the target is one of the guard's own dispatch tables.
 
         Both live locations count: the plugin directory (explicit override)
@@ -1264,28 +1295,26 @@ class DispatchGuardMiddleware(MiddlewareBase):
         guard's own two directories would be refused — a file nobody has a
         reason to write there, against a bypass that works on every macOS
         and Windows host.
+
+        ``~`` is a shell spelling, not a directory name: expanding it is what
+        lets a redirect aimed at ``~/.qwenpaw/plugins/dispatch-guard/
+        routes.json`` be recognised as the same file the absolute spelling
+        names (B7). A relative target resolves against ``base`` when given
+        (a shell's ``cd`` destination) and against the workspace otherwise.
         """
         text = _canonical_target(str(target))
         if Path(text).name.lower() not in _GUARD_CONFIG_NAMES:
             return False
-        # ``~`` is a shell spelling, not a directory name. Expanding it is what
-        # lets a redirect aimed at "~/.qwenpaw/plugins/dispatch-guard/
-        # routes.json" be recognised as the same file the absolute spelling
-        # names (B7); left alone it joined onto the workspace and resolved
-        # nowhere, so the mutation tier silently downgraded to a warning.
-        p = Path(self._rel(os.path.expanduser(text)))
+        p = Path(os.path.expanduser(text))
         if not p.is_absolute():
-            p = self._ws / p
+            p = (base if base is not None else self._ws) / p
         try:
             rp = p.resolve()
         except (OSError, ValueError, RuntimeError):
             rp = Path(os.path.normpath(str(p)))
-        for root in (PLUGIN_DIR, _data_dir()):
-            try:
-                rp.relative_to(root.resolve())
+        for root in self._guard_home_dirs():
+            if rp == root or root in rp.parents:
                 return True
-            except (ValueError, OSError):
-                continue
         return False
 
     def _guard_table_paths(self) -> tuple[str, ...]:
@@ -1322,19 +1351,73 @@ class DispatchGuardMiddleware(MiddlewareBase):
                             out.append(spelling)
         return tuple(out)
 
+    def _named_guard_path(self, cmd: str) -> str | None:
+        """A real table spelling the command names, boundary-anchored (B9).
+
+        Case-insensitive because the write-tier judgment is (D12's yardstick
+        is one rule): on a case-insensitive host ROUTES.JSON is the table.
+        Boundary-anchored because routes.json.bak is a backup and
+        routes.json5 is another file; a substring match denied both.
+        """
+        low = cmd.lower()
+        for path in self._guard_table_paths():
+            pl = path.lower()
+            start = 0
+            while True:
+                at = low.find(pl, start)
+                if at < 0:
+                    break
+                end = at + len(pl)
+                if end == len(low) or low[end] not in _PATH_CONT_CHARS:
+                    return path
+                start = end
+        return None
+
     def _guard_table_shell_hit(self, cmd: str) -> tuple[str | None, bool]:
-        """(guard-table path named in cmd, is_a_mutation) — see B1 above."""
-        named = next((p for p in self._guard_table_paths() if p in cmd), None)
-        if named is None:
-            return None, False
+        """(guard-table path named in cmd, is_a_mutation) — see B1 above.
+
+        Two ways to name the table: one of the real path spellings, or a
+        ``cd`` into one of the guard's homes followed by a bare basename —
+        which is what the basename then resolves to (B9).
+        """
+        named = self._named_guard_path(cmd)
+        if named is not None:
+            return named, self._writes_guard_table(cmd, None)
+        return self._cd_into_guard_home_hit(cmd)
+
+    def _cd_into_guard_home_hit(self, cmd: str) -> tuple[str | None, bool]:
+        homes = self._guard_home_dirs()
+        for match in _CD_INTO_RE.finditer(cmd):
+            dest = match.group(1).strip("\"'")
+            try:
+                p = Path(os.path.expanduser(dest))
+            except (RuntimeError, ValueError):
+                continue
+            if not p.is_absolute():
+                p = self._ws / p
+            try:
+                resolved = p.resolve()
+            except (OSError, ValueError, RuntimeError):
+                resolved = Path(os.path.normpath(str(p)))
+            if resolved not in homes:
+                continue
+            rest = cmd[match.end():]
+            bare = _BARE_GUARD_BASENAME_RE.search(rest)
+            if bare is None:
+                continue
+            return bare.group(1), self._writes_guard_table(rest, resolved)
+        return None, False
+
+    def _writes_guard_table(self, cmd: str, base: Path | None) -> bool:
         # An output position is unambiguous: the same patterns D6/D7 built
         # already know where bytes land, and _is_guard_config confirms the
-        # captured token is one of the guard's two tables.
+        # captured token is one of the guard's two tables. The verb list
+        # stays the coarse fallback for shapes the patterns do not model.
         for pattern in SHELL_OUTPUT_PATTERNS:
             for match in pattern.finditer(cmd):
-                if self._is_guard_config(match.group(1).strip("\"'")):
-                    return named, True
-        return named, bool(_GUARD_TABLE_MUTATE_RE.search(cmd))
+                if self._is_guard_config(match.group(1).strip("\"'"), base):
+                    return True
+        return bool(_GUARD_TABLE_MUTATE_RE.search(cmd))
 
     def _guard_table_meta_hit(
         self, name: str, raw_input: Any, cfg: dict[str, Any]
