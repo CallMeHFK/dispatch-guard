@@ -705,7 +705,7 @@ def _shell_command(raw_input: Any) -> str:
     return str(raw_input)
 
 
-def _strings_in(value: Any, depth: int = 0) -> Iterator[str]:
+def _strings_in(value: Any, budget: int = 100_000) -> Iterator[str]:
     """Every string reachable in a tool input, at any nesting depth.
 
     A path argument the guard cannot recognise as one is still a path: the
@@ -713,22 +713,29 @@ def _strings_in(value: Any, depth: int = 0) -> Iterator[str]:
     gated on ``target_is_path`` and walk straight past them. Walking the
     whole input means nesting buys nothing.
 
-    Depth-capped because the input is untrusted and this runs before the
-    fail-open wrapper in ``on_acting``: a deeply nested body must cost a
-    bounded amount of work and must not raise RecursionError out of the
-    middleware. Past the cap the remainder is simply not inspected.
+    Iterative, not recursive, and budgeted (B10): the input is untrusted and
+    this runs inside the meta-integrity gate, above on_acting's fail-open
+    wrapper, so a deeply nested body must cost bounded work and must not
+    raise RecursionError out of the middleware. The budget caps nodes
+    visited, and it fails toward more scanning, not less: whatever did not
+    fit is serialized and yielded whole, so a path parked past the budget is
+    still seen as text.
     """
-    if isinstance(value, str):
-        yield value
-    elif depth >= 12:
-        return
-    elif isinstance(value, dict):
-        for key, item in value.items():
-            yield from _strings_in(key, depth + 1)
-            yield from _strings_in(item, depth + 1)
-    elif isinstance(value, (list, tuple, set, frozenset)):
-        for item in value:
-            yield from _strings_in(item, depth + 1)
+    stack: list[Any] = [value]
+    while stack and budget > 0:
+        item = stack.pop()
+        budget -= 1
+        if isinstance(item, str):
+            yield item
+        elif isinstance(item, dict):
+            for key, entry in item.items():
+                stack.append(key)
+                stack.append(entry)
+        elif isinstance(item, (list, tuple, set, frozenset)):
+            stack.extend(item)
+        # non-string scalars carry no path
+    if stack:
+        yield repr(stack)
 
 
 def _deliverable_exts(cfg: dict[str, Any]) -> frozenset[str]:
@@ -1112,7 +1119,7 @@ def _tool_call_parts(tool_call: Any) -> tuple[str, Any]:
     return str(name), getattr(tool_call, "input", "") or ""
 
 
-def _has_typed_path_value(raw_input: Any) -> bool:
+def _has_nonstring_path_value(raw_input: Any) -> bool:
     """True when a path-argument key holds a non-string value (D3)."""
     if not isinstance(raw_input, dict):
         return False
@@ -1429,9 +1436,24 @@ class DispatchGuardMiddleware(MiddlewareBase):
         it is the one write that decides whether any other rule applies.
         """
         if name in _write_tools(cfg):
-            # Every string in the input is a candidate, not just the
-            # recognised path argument: gating on target_is_path let the D3
-            # list/dict shapes walk past the check entirely (B3).
+            # The gate reads path arguments, not prose (B10): a content body
+            # that happens to hold the table's path string is data, and
+            # refusing it was a payload/path confusion, not a guard. Walking
+            # a recognised path key's VALUE still covers the D3 shapes — a
+            # list- or dict-valued file_path hides the path by nesting, not
+            # by renaming it. Only when no path key exists at all does the
+            # whole input get scanned (a write tool with an unusual argument
+            # name), the same fallback _target_of takes.
+            if isinstance(raw_input, dict):
+                found_path_key = False
+                for key in ("file_path", "path", "filename", "file"):
+                    if key in raw_input:
+                        found_path_key = True
+                        for candidate in _strings_in(raw_input[key]):
+                            if self._is_guard_config(candidate):
+                                return candidate, True
+                if found_path_key:
+                    return None
             for candidate in _strings_in(raw_input):
                 if self._is_guard_config(candidate):
                     return candidate, True
@@ -1907,7 +1929,7 @@ class DispatchGuardMiddleware(MiddlewareBase):
                 found = self._scan_candidates(target, cfg)
                 if found:
                     rel, explicit = found[0]
-                    if _has_typed_path_value(raw_input):
+                    if _has_nonstring_path_value(raw_input):
                         # D3: a deliverable shape inside a non-string path
                         # argument is an explicit write target, not a casual
                         # mention.
