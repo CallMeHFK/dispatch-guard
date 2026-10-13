@@ -789,6 +789,102 @@ class ReviewRegressionTest(unittest.TestCase):
         finally:
             dg.PLUGIN_DIR = saved
 
+    # -- B8: the meta gate sits above on_acting's fail-open wrapper (F17), so
+    #    it must be total -----------------------------------------------
+
+    def test_meta_gate_never_raises_on_unserializable_input(self):
+        # A shell input whose dict contains a set is not JSON-serializable;
+        # _shell_command's json.dumps fallback raised TypeError straight out
+        # of the middleware — the one failure shape F17 exists to prevent.
+        # The fix is to make the gate total, not to catch it higher up.
+        r = run(self.mw, "execute_shell_command", {"x": {1, 2}})
+        self.assertNotEqual(r[0].state, "denied")
+        # and the guard is still armed for the next call
+        r2 = run(self.mw, "write_file", {"file_path": "outputs/a.docx"})
+        self.assertEqual(r2[0].state, "denied")
+
+    # -- B9: cd-into-guard-home, path boundary, case, and ln ----------------
+
+    def test_shell_cd_into_guard_home_makes_bare_basename_a_write(self):
+        # The narrowed arm matched real path spellings in the command text,
+        # but a shell can cd into the guard's home and then write the bare
+        # basename; each of these rewrote the table on the previous commit
+        # with not even a warning.
+        home = str(dg.PLUGIN_DIR)
+        variants = [
+            f"cd {home} && echo '{{\"mode\":\"off\"}}' > routes.json",
+            f"cd {home} && sed -i s/enforce/off/ routes.json",
+            f"cd {home} && rm -f routes.json",
+            f"cd {home}; ln -sf /tmp/evil.json routes.json",
+        ]
+        for cmd in variants:
+            with self.subTest(cmd=cmd):
+                self._write_config(dict(self._GUARD_TABLE_CFG))
+                r = run(self.mw, "execute_shell_command", {"command": cmd})
+                self.assertEqual(r[0].state, "denied")
+
+    def test_shell_table_match_is_boundary_anchored_and_case_agnostic(self):
+        # Boundary: routes.json.bak is a backup, routes.json5 is another
+        # file; neither is the guard's table, so neither may be refused.
+        # Case: the write-tier judgment (D12's yardstick) is case-insensitive,
+        # so the naming tier may not be case-sensitive either — on a
+        # case-insensitive host ROUTES.JSON IS the table.
+        self._write_config(dict(self._GUARD_TABLE_CFG))
+        innocent = [
+            f"rm -f {dg.PLUGIN_DIR / 'routes.json.bak'}",
+            f"cat {dg.PLUGIN_DIR / 'routes.json5'}",
+        ]
+        for cmd in innocent:
+            with self.subTest(cmd=cmd):
+                r = run(self.mw, "execute_shell_command", {"command": cmd})
+                self.assertNotEqual(r[0].state, "denied")
+        hostile = [
+            f"echo x > {dg.PLUGIN_DIR / 'ROUTES.JSON'}",
+            f"ln -sf /tmp/evil.json {dg.PLUGIN_DIR / 'routes.json'}",
+        ]
+        for cmd in hostile:
+            with self.subTest(cmd=cmd):
+                r = run(self.mw, "execute_shell_command", {"command": cmd})
+                self.assertEqual(r[0].state, "denied")
+
+    # -- B10: the strings walker must not cap out, and the gate scans path
+    #    arguments, not prose ------------------------------------------------
+
+    def test_guard_table_path_nested_deep_is_still_denied(self):
+        # The recursive walker stopped at depth 12 and said nothing, so a
+        # table path hidden 14 dicts deep passed untouched. The walk is now
+        # iterative with a node budget that fails toward more scanning, not
+        # less.
+        target = str(dg.PLUGIN_DIR / "routes.json")
+        nested = target
+        for _ in range(14):
+            nested = {"a": nested}
+        r = run(self.mw, "write_file", {"file_path": nested, "content": "{}"})
+        self.assertEqual(r[0].state, "denied")
+        # and a chain far deeper than any recursion limit still completes
+        nested = target
+        for _ in range(500):
+            nested = {"a": nested}
+        r = run(self.mw, "write_file", {"file_path": nested, "content": "{}"})
+        self.assertEqual(r[0].state, "denied")
+
+    def test_content_mentioning_the_table_path_is_not_a_write_target(self):
+        # The gate scans path arguments, not prose. The review's finding was
+        # content equal to the table path string itself being refused; prose
+        # that merely contains it was never refused and must stay that way.
+        target = str(dg.PLUGIN_DIR / "routes.json")
+        for label, content in (
+            ("content is the path", target),
+            ("prose containing the path", f"config lives at {target}"),
+        ):
+            with self.subTest(label=label):
+                r = run(
+                    self.mw,
+                    "write_file",
+                    {"file_path": "notes/x.md", "content": content},
+                )
+                self.assertNotEqual(r[0].state, "denied")
+
 
 if __name__ == "__main__":
     unittest.main()

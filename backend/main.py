@@ -666,13 +666,22 @@ def _redacted_audit_target(raw: str) -> str:
 
 
 def _shell_command(raw_input: Any) -> str:
-    """The command line of a shell tool call, whatever shape it arrives in."""
+    """The command line of a shell tool call, whatever shape it arrives in.
+
+    Must be total: it runs inside the meta-integrity gate, above on_acting's
+    fail-open wrapper, so a TypeError here would escape the middleware — the
+    one failure shape F17 exists to prevent. A dict carrying a set is not
+    JSON-serializable; repr is always available and still gives the scanners
+    every path string the input holds.
+    """
     if isinstance(raw_input, dict):
-        return str(
-            raw_input.get("command")
-            or raw_input.get("cmd")
-            or json.dumps(raw_input, ensure_ascii=False)
-        )
+        cmd = raw_input.get("command") or raw_input.get("cmd")
+        if isinstance(cmd, str) and cmd:
+            return cmd
+        try:
+            return json.dumps(raw_input, ensure_ascii=False)
+        except (TypeError, ValueError):
+            return repr(raw_input)
     return str(raw_input)
 
 
@@ -1288,7 +1297,13 @@ class DispatchGuardMiddleware(MiddlewareBase):
         has to name one of these to be touching the guard's authority — that
         is what keeps the check off a project's own ``routes.json``.
         """
-        home = str(Path.home())
+        try:
+            home = str(Path.home())
+        except RuntimeError:
+            # No determinable home (a container without $HOME): the ~ spellings
+            # simply cannot be produced, so skip them rather than raise out of
+            # a gate that runs above the fail-open wrapper.
+            home = ""
         out: list[str] = []
         for root in (PLUGIN_DIR, _data_dir()):
             for name in sorted(_GUARD_CONFIG_NAMES):
@@ -1301,7 +1316,7 @@ class DispatchGuardMiddleware(MiddlewareBase):
                     if not form:
                         continue
                     for spelling in (form, *(
-                        ("~" + form[len(home):],) if form.startswith(home + os.sep) else ()
+                        ("~" + form[len(home):],) if home and form.startswith(home + os.sep) else ()
                     )):
                         if spelling not in out:
                             out.append(spelling)
@@ -1612,7 +1627,20 @@ class DispatchGuardMiddleware(MiddlewareBase):
         # promise was false in the one mode that mattered. Both the write-tool
         # and the shell spelling are handled here, so neither can reach the
         # routing logic underneath.
-        meta = self._guard_table_meta_hit(name, raw_input, cfg)
+        #
+        # The gate sits above the fail-open wrapper, so it must be total: any
+        # exception here would escape the middleware, the one failure shape
+        # F17 exists to prevent (a shell input carrying a set once did exactly
+        # that, out of json.dumps). Helpers are written to be total and the
+        # call is wrapped regardless; a failure fails open with a host-log
+        # line, never a crash and never a silent gap.
+        try:
+            meta = self._guard_table_meta_hit(name, raw_input, cfg)
+        except Exception:  # noqa: BLE001 — F17 applies up here too
+            logger.exception(
+                "dispatch-guard: meta-integrity probe failed; continuing (fail-open)"
+            )
+            meta = None
         if meta is not None:
             path, is_write = meta
             shown = self._rel(_canonical_target(path))
@@ -1647,17 +1675,19 @@ class DispatchGuardMiddleware(MiddlewareBase):
 
         if mode == "off":
             # D14: off short-circuits here, not in the factory. Everything
-            # passes, but the first off-observed call after entering (or
-            # re-entering) off writes one audit record and a host-log line:
-            # operators keep visibility into what ran while disarmed, and
-            # flipping the table back to enforce hot-applies on the next
-            # mtime reload — no new session required.
+            # passes except a write to the guard's own tables, which the gate
+            # above already refused — but the first off-observed call after
+            # entering (or re-entering) off writes one audit record and a
+            # host-log line: operators keep visibility into what ran while
+            # disarmed, and flipping the table back to enforce hot-applies on
+            # the next mtime reload — no new session required.
             global _OFF_LOGGED
             if not _OFF_LOGGED:
                 _OFF_LOGGED = True
                 logger.info(
-                    "dispatch-guard: mode=off — attached and passing all tool "
-                    "calls (audit action=off marks the start of this period)"
+                    "dispatch-guard: mode=off — attached and passing tool "
+                    "calls (guard-table writes still refused; audit action=off "
+                    "marks the start of this period)"
                 )
                 self._log(
                     {
@@ -1666,7 +1696,8 @@ class DispatchGuardMiddleware(MiddlewareBase):
                         "target": "",
                         "mode": "off",
                         "message": "guard disarmed by config; calls pass unexamined "
-                        "until mode returns to enforce/warn",
+                        "until mode returns to enforce/warn — except writes to "
+                        "the guard's own tables, which stay refused (D1)",
                     }
                 )
             async for event in next_handler():
