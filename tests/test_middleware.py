@@ -419,21 +419,39 @@ class DispatchGuardTest(unittest.TestCase):
         # down over a layout it had never actually read — the fail-open D8
         # was meant to close, arrived at by a different route.
         #
-        # A dangling symlink stands in for a permission wall: both surface as
-        # OSError from read_text, and this form does not depend on the uid
-        # the suite happens to run under (chmod 0o000 is a no-op for root).
+        # A real chmod wall, not a symlink: Python's glob lists a
+        # zero-permission file in every version, while dangling symlinks
+        # surface inconsistently across versions (3.12 lists them, 3.10/3.11
+        # do not) — the symlink form made this test fail in CI instead of
+        # asserting the behavior. Skips when the sandbox cannot enforce
+        # permissions (root), rather than silently passing.
         d = Path(self.ws) / "agents" / "DocAgent"
         d.mkdir(parents=True)
-        (d / "agent.json").symlink_to(Path(self.ws) / "agents" / "gone.json")
-        self._bust_config_cache()
-        agents, readable = dg._discover_agents(self.ws)
-        self.assertEqual(agents, [])
-        self.assertFalse(
-            readable, "an unreadable manifest is not a readable-empty inventory"
+        manifest = d / "agent.json"
+        manifest.write_text(
+            json.dumps({"id": "DocAgent", "skills": ["文档"]}), encoding="utf-8"
         )
-        self._bust_config_cache()
-        r = run(self.mw, "write_file", {"file_path": "outputs/report.docx"})
-        self.assertEqual(r[0].state, "denied")
+        manifest.chmod(0o000)
+        try:
+            try:
+                manifest.read_text(encoding="utf-8")
+            except PermissionError:
+                pass  # the wall holds; proceed
+            else:
+                self.skipTest("running with permission to read a 0o000 file")
+            self._bust_config_cache()
+            agents, readable = dg._discover_agents(self.ws)
+            self.assertEqual(agents, [])
+            self.assertFalse(
+                readable, "an unreadable manifest is not a readable-empty inventory"
+            )
+            self._bust_config_cache()
+            r = run(self.mw, "write_file", {"file_path": "outputs/report.docx"})
+            self.assertEqual(r[0].state, "denied")
+        finally:
+            # Restore before the temp tree is removed (an addCleanup would run
+            # after tearDown's cleanup and chmod a path that no longer exists).
+            manifest.chmod(0o644)
 
     def test_unreadable_agent_directory_keeps_guard_armed(self):
         # B12: one level up from B4. pathlib's glob swallows a PermissionError
