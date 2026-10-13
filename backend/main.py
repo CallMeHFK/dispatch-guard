@@ -1259,7 +1259,12 @@ class DispatchGuardMiddleware(MiddlewareBase):
         text = _canonical_target(str(target))
         if Path(text).name.lower() not in _GUARD_CONFIG_NAMES:
             return False
-        p = Path(self._rel(text))
+        # ``~`` is a shell spelling, not a directory name. Expanding it is what
+        # lets a redirect aimed at "~/.qwenpaw/plugins/dispatch-guard/
+        # routes.json" be recognised as the same file the absolute spelling
+        # names (B7); left alone it joined onto the workspace and resolved
+        # nowhere, so the mutation tier silently downgraded to a warning.
+        p = Path(self._rel(os.path.expanduser(text)))
         if not p.is_absolute():
             p = self._ws / p
         try:

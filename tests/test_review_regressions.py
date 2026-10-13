@@ -755,6 +755,40 @@ class ReviewRegressionTest(unittest.TestCase):
             with self.subTest(rel=rel):
                 self.assertFalse(dg.DispatchGuardMiddleware._whitelisted(rel))
 
+    def test_guard_table_tilde_spelling_is_a_mutation_not_a_mention(self):
+        # B7: _guard_table_paths publishes the ~-compressed spelling because
+        # that is what an operator or an agent is likeliest to type, so the
+        # naming tier matched it — but the mutation tier resolves through
+        # _is_guard_config, which joined "~" onto the workspace instead of
+        # expanding it. A redirect, `sed -i` or `tee` aimed at the ~ form
+        # therefore warned instead of being refused, while the identical
+        # absolute spelling was refused: the documented "mutating one is
+        # refused in every mode" was false for the spelling the docs invite.
+        fake = Path.home() / ".dg-tilde-probe" / "plugins" / "dispatch-guard"
+        rel = ".dg-tilde-probe/plugins/dispatch-guard/routes.json"
+        saved = dg.PLUGIN_DIR
+        dg.PLUGIN_DIR = fake
+        try:
+            self.assertTrue(self.mw._is_guard_config(f"~/{rel}"))
+            self.assertTrue(self.mw._is_guard_config(f"~/{rel}."))
+            for cmd in (
+                f"echo '{{}}' > ~/{rel}",
+                f"sed -i s/enforce/off/ ~/{rel}",
+                f"printf x | tee ~/{rel}",
+                f"cp /tmp/evil.json ~/{rel}",
+            ):
+                with self.subTest(cmd=cmd):
+                    named, is_write = self.mw._guard_table_shell_hit(cmd)
+                    self.assertIsNotNone(named)
+                    self.assertTrue(is_write, "~ spelling must count as a mutation")
+            # The absolute spelling already worked; do not regress it.
+            _, is_write = self.mw._guard_table_shell_hit(
+                f"echo '{{}}' > {fake / 'routes.json'}"
+            )
+            self.assertTrue(is_write)
+        finally:
+            dg.PLUGIN_DIR = saved
+
 
 if __name__ == "__main__":
     unittest.main()
