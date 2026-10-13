@@ -1,5 +1,129 @@
 # Changelog
 
+<!-- The top section is deliberately not a `## vX.Y.Z` heading.
+     tests/test_release_hygiene.py requires the newest versioned section to
+     equal plugin.json's version, and the version bump was deferred to the
+     maintainer, so a versioned heading here would fail that gate.
+     packaging/release_notes.py can only address a versioned section: when this
+     ships, rename the heading to `## vX.Y.Z`, bump plugin.json in the same
+     change — which is what CONTRIBUTING asks for and what the hygiene test
+     enforces — and delete this comment. It lives above the first heading
+     because extract() takes everything below a heading up to the next one, so
+     a note inside the section would ship inside the release page. -->
+
+## Unreleased — v0.1.9 评审修复 (review-20261012)
+
+Adversarial review 2026-10-12 (`review-20261012.md`) found 17 defects
+(D1–D17) plus fail-open consistency items (F1–F18). Every fix landed on
+`fix/review-20261012`; the review's 12-case evidence pack now passes 12/12,
+and the repository suite covers every finding with targeted regression tests.
+A second review pass over the fixes found ten more defects (B1–B10 —
+a shell-arm false-positive surface, audit redaction gaps, meta-integrity
+bypasses by mode, path shape, case and `cd`, a discovery fail-open, a
+canonicalisation bypass, coverage gaps, a `~`-spelling hole, a gate that
+could crash the middleware, and a strings walker that capped out) — all
+closed and pinned by regressions on this branch.
+
+- **D1 (Blocker) — the guarded agent can no longer rewrite its own dispatch
+  table.** `routes.json`/`routes.draft.json` basenames are excluded from
+  every whitelist (the plugin tree included), a write to either home is
+  refused in every mode the middleware observes — `off` included, and
+  whichever shape the path arrives in (string, list, dict, upper-case,
+  trailing dot) — and only lint-clean tables mirror into plugin-data.
+  The shell arm (D1-shell) matches the guard's two **real table paths**, not
+  the bare basename: naming one warns, mutating one (redirect, `tee`,
+  `sed -i`, `rm`/`mv`/`truncate`/`ln`, an in-process `open(..., "w")`) is
+  refused in every mode and regardless of `shell_enforce`. Matching is
+  case-insensitive and boundary-anchored (`routes.json.bak` is a backup, not
+  the table; `ROUTES.JSON` IS the table on a case-insensitive host), expands
+  `~`, and also covers a bare basename after a `cd` into a guard home in the
+  same command. A project's own `routes.json` is never matched, so reading
+  or grepping it stays untouched. The meta-integrity gate itself is total —
+  it runs above the fail-open wrapper, and an unserializable input used to
+  raise TypeError out of the middleware through it; it now fails open like
+  everything else under F17.
+- **D2 — dict-shaped `tool_call` no longer disarms the guard.** `on_acting`
+  accepts Mapping-shaped calls; an unrecognizable shape is audited and
+  spawn-suspect payloads are refused under the most conservative reading.
+- **D3 — non-string `file_path` values (list/dict) are no longer str()-coerced
+  into silent passes.** They route through the full-field scan; a deliverable
+  inside them is treated as an explicit target.
+- **D4 — `"match": null` degrades instead of crashing.** Normalization coerces
+  null/non-list `match` to `[]` and members to strings; `_route_hit` skips
+  non-strings. Per the ruling: a null-match rule owns nothing, so such a
+  table passes writes with `no_owner` records rather than denying them.
+- **D5 — a malformed agent manifest (int/bool `skills`) degrades to that
+  agent not existing** instead of crashing every deliverable interception.
+- **D6 — shell redirects `>|` (noclobber) and `tee` long options
+  (`--append`) are visible targets.**
+- **D7 — downloader/archiver/compiler/in-place-editor outputs are covered**:
+  `curl -o/-O`, `wget -O`/`--output-document`, `dd of=`, `zip`/`tar` creation
+  (short bundle `tar czf`/`tar cf` and long `--create --file[=]`), compiler
+  `-o` for `gcc`/`g++`/`clang`/`clang++`/`cc`/`c++` in split and joined form,
+  short output flags with the value joined (`curl -oFILE`), generic
+  `--outdir`/`--output`, and `sed`/`perl -i` rewriting their trailing file
+  argument. Read shapes (`tar xf`, `tar tf`, `sed -n`, `ffmpeg -i`), `find`'s
+  `-o` operator and non-deliverable `-o` targets stay silent.
+- **D8 — zero-agent environments now match the documented promise.** A
+  readable-but-empty inventory is a genuine single-agent deployment: every
+  class is `no_owner`, writes pass with an audit record. Discovery keeps
+  trusting the operator's table only when it could not read the layout — the
+  walk failed, **or a manifest exists but could not be opened**: a permission
+  wall used to parse to nothing and report itself as "no specialists here",
+  disarming the guard. Deny text never points at an invented "对应专业
+  agent" — an unresolvable owner is handed back to the user.
+- **D9 — extension perturbation cannot erase routing.** Trailing dots and
+  whitespace are canonicalized to a fixed point before deliverable and route
+  decisions, and `_whitelisted` canonicalizes through the same function:
+  `report.docx.` routes as `report.docx`, and so does `report.docx .`, whose
+  alternating dot-and-space ending used to survive a single strip-then-rstrip
+  pass and match nothing at all — silently, with no audit record.
+- **D10 — free-form task text is logged as a digest, not verbatim**:
+  sha256[:16] + length + an excerpt filtered for known credential shapes
+  (`sk-*`, AWS access key ids, `Bearer …`, `key=value` and `key is value`
+  assignments). This covers the spawn backstop **and** a tool call whose shape
+  the guard cannot parse, which is the path that used to write the raw
+  structure — credential included — straight into the jsonl. The filter is not
+  a secret scanner: a credential in an unrecognised spelling can still appear
+  in the capped excerpt.
+- **D11 — a legitimate path key no longer closes the scan of the rest of the
+  input.** Deliverables hidden in other arguments earn a mention-level
+  warning (never a deny from that tier).
+- **D12 — one yardstick for whitelist and deliverable judgment**: both
+  case-insensitive, matching `_is_deliverable`'s lowercasing; `Notes/x.docx`
+  is no longer denied where `notes/x.docx` passes.
+- **D13 — a parse failure keeps the last known-good table** with a loud
+  warning instead of silently disarming; only a cold cache with nothing
+  good ever loaded fails open to `off`.
+- **D14 — `mode=off` no longer detaches the middleware.** The factory
+  always attaches; off short-circuits inside `on_acting`, so an
+  off→enforce flip hot-applies like every other flip, and each disarmed
+  period is marked by one `action=off` audit record.
+- **D15 — a missing `routes` key is a legal minimal config**, not a type
+  error; the wrong-type warning fires only on an explicit null or wrong
+  type.
+- **D16 — non-string `deliverable_dirs` members are dropped with a warning**
+  instead of `str()`-coercing into invented `none/` / `5/` directories.
+- **D17 — the private-payload check matches table basenames at any directory
+  depth**: `backend/routes.json` or `sub/routes.draft.json` in the candidate
+  set can no longer slip into the published archive.
+- **F17 — a guard-internal exception never bubbles out of the middleware**:
+  it is host-logged, audited, and failed open with a visible warning block
+  (the never-wedge rule), and a tool whose response already started is
+  never re-run.
+- Documentation synced to the implementation. `docs/DESIGN.md`: the
+  "no owner, no block" asymmetry is now the three-state rule the code
+  implements (specialists found / readable-empty / unreadable), "fail-open"
+  describes the last-known-good fallback and names the guard's own table as
+  the second exception, the shell tiers carry the meta-integrity exception,
+  and the stale root-level `.pdf` claim (`review-20261012.md` §8.3 item 1) is
+  corrected — `reports/q3.pdf` is deliverable, `.pdf` being a default
+  extension, and was never passed. README and plugin.json `meta.notes`: off
+  semantics and hot-reload, the shell coverage families, the no-owner rule,
+  last-known-good
+  fail-open, case-insensitive matching, the guard-table path matching, and
+  what audit redaction does and does not catch.
+
 ## v0.1.9
 
 - **Your dispatch table now survives plugin reinstalls.** The host installer

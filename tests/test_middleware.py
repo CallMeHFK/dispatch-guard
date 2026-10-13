@@ -62,9 +62,9 @@ class DispatchGuardTest(unittest.TestCase):
         self.saved_agents_cache = dict(dg._AGENTS_CACHE)
         self.saved_draft_written = dg._DRAFT_WRITTEN
         self.saved_no_owner_logged = dg._NO_OWNER_LOGGED
-        # The host installs plugins outside the agent workspace; mirroring that is
-        # what keeps PLUGIN_DIR paths absolute through _rel() and lets the
-        # absolute-path-only plugin whitelist fire.
+        self.saved_off_logged = dg._OFF_LOGGED
+        # The host installs plugins outside the agent workspace; mirroring that
+        # keeps PLUGIN_DIR paths absolute through _rel().
         self.plugin_tmp = tempfile.TemporaryDirectory()
         self.plugin_tree = Path(self.plugin_tmp.name)
         self.routes_path = self.plugin_tree / "routes.json"
@@ -83,6 +83,7 @@ class DispatchGuardTest(unittest.TestCase):
         dg._AGENTS_CACHE.update(self.saved_agents_cache)
         dg._DRAFT_WRITTEN = self.saved_draft_written
         dg._NO_OWNER_LOGGED = self.saved_no_owner_logged
+        dg._OFF_LOGGED = self.saved_off_logged
         self.tmp.cleanup()
         self.plugin_tmp.cleanup()
 
@@ -96,6 +97,7 @@ class DispatchGuardTest(unittest.TestCase):
         dg._AGENTS_CACHE.update({"ws": None, "agents": None, "ids": frozenset()})
         dg._DRAFT_WRITTEN = False
         dg._NO_OWNER_LOGGED = False
+        dg._OFF_LOGGED = False
 
     def _inject_mode(self, mode):
         cfg = json.loads((REPO / "routes.example.json").read_text(encoding="utf-8"))
@@ -106,6 +108,7 @@ class DispatchGuardTest(unittest.TestCase):
     # -- write tools ------------------------------------------------------
 
     def test_deny_deliverable_write_with_route_hint(self):
+        self._live_specialists()
         r = run(self.mw, "write_file", {"file_path": "outputs/report.docx"})
         self.assertEqual(r[0].state, "denied")
         self.assertIn("DocAgent", r[0].content[0].text)
@@ -120,8 +123,22 @@ class DispatchGuardTest(unittest.TestCase):
         self.assertEqual(r[0].content[0].text, "ok")
 
     def test_deny_projects_generic_hint(self):
-        r = run(self.mw, "write_file", {"file_path": "projects/x/reports/r.md"})
+        # Unrouted deliverable class in an environment whose agent inventory
+        # cannot be READ (the only way trust-the-table still justifies a
+        # block after D8): the deny must name no invented owner — the advice
+        # is to hand the decision to the user, not "dispatch to the
+        # corresponding specialist agent".
+        bad_root = mock.MagicMock()
+        bad_root.is_dir.return_value = True
+        bad_root.glob.side_effect = OSError(5, "Injected I/O error")
+        with mock.patch.object(
+            dg, "_discovery_roots", return_value=[Path(self.ws) / "agents", bad_root]
+        ):
+            r = run(self.mw, "write_file", {"file_path": "projects/x/reports/r.md"})
         self.assertEqual(r[0].state, "denied")
+        text = r[0].content[0].text
+        self.assertNotIn("submit_to_agent", text)
+        self.assertNotIn("对应专业 agent", text)
 
     def test_native_string_input_is_parsed(self):
         # Host-native tools deliver input as a JSON *string*; the guard must
@@ -159,9 +176,11 @@ class DispatchGuardTest(unittest.TestCase):
         self.assertEqual(r[0].content[0].text, "ok")
 
     def test_deliverable_exts_config_extends_defaults(self):
+        self._live_specialists()
         cfg = json.loads((REPO / "routes.example.json").read_text(encoding="utf-8"))
         cfg["mode"] = "enforce"
         cfg["deliverable_exts"] = [".cfg"]
+        cfg["ext_routes"][".cfg"] = "DocAgent"
         self.routes_path.write_text(json.dumps(cfg, ensure_ascii=False), encoding="utf-8")
         self._bust_config_cache()
         r = run(self.mw, "write_file", {"file_path": "app.cfg"})
@@ -190,12 +209,18 @@ class DispatchGuardTest(unittest.TestCase):
     # -- shell ------------------------------------------------------------
 
     def test_shell_deliverable_warn_only(self):
+        self._live_specialists()
         r = run(self.mw, "execute_shell_command", {"command": "pandoc a.md -o outputs/r.docx"})
         self.assertEqual(len(r), 1)  # not denied
         self.assertEqual(len(r[0].content), 2)
         self.assertIn("dispatch-guard warn", r[0].content[1].text)
 
     def test_shell_redirect_into_deliverable_warns(self):
+        self._live_specialists()
+        cfg = json.loads((REPO / "routes.example.json").read_text(encoding="utf-8"))
+        cfg["mode"] = "enforce"
+        cfg["ext_routes"][".md"] = "DocAgent"
+        self._configure(cfg)
         r = run(self.mw, "execute_shell_command", {"command": "echo '# hi' > outputs/README.md"})
         self.assertEqual(len(r[0].content), 2)
         self.assertIn("dispatch-guard warn", r[0].content[1].text)
@@ -225,14 +250,35 @@ class DispatchGuardTest(unittest.TestCase):
         self.assertIsNone(dg._factory(FakeCtx(self.ws), FakeCfg("CodeAgent")))
         self.assertIsNotNone(dg._factory(FakeCtx(self.ws), FakeCfg("default")))
 
-    def test_mode_off_removes_factory(self):
+    def test_mode_off_stays_attached_with_minimal_audit(self):
+        # D14: the factory no longer detaches on off. The middleware
+        # short-circuits inside on_acting, so (a) an off→enforce flip
+        # hot-applies by mtime without a new session, and (b) the off
+        # period is not audit-blind: the first off-observed call records
+        # one action=off line, then stays quiet.
         self._inject_mode("off")
         try:
-            self.assertIsNone(dg._factory(FakeCtx(self.ws), FakeCfg("default")))
+            mw = dg._factory(FakeCtx(self.ws), FakeCfg("default"))
+            self.assertIsNotNone(mw, "off keeps the middleware attached (D14)")
+            r = run(mw, "write_file", {"file_path": "outputs/report.docx"})
+            self.assertNotEqual(r[0].state, "denied", "off passes everything")
+            records = self._audit_records()
+            self.assertEqual(records[-1]["action"], "off")
+            count = len(records)
+            run(mw, "write_file", {"file_path": "outputs/report.docx"})
+            self.assertEqual(
+                len(self._audit_records()), count, "off audits once per period"
+            )
+            # The asymmetry that D14 removed: flipping back hot-applies.
+            self._live_specialists()
+            self._inject_mode("enforce")
+            r = run(mw, "write_file", {"file_path": "outputs/report.docx"})
+            self.assertEqual(r[0].state, "denied", "enforce hot-loads after off")
         finally:
             self._inject_mode("enforce")
 
     def test_warn_mode_passes_with_warning(self):
+        self._live_specialists()
         self._inject_mode("warn")
         try:
             r = run(self.mw, "write_file", {"file_path": "outputs/x.docx"})
@@ -276,12 +322,17 @@ class DispatchGuardTest(unittest.TestCase):
 
     def test_malformed_routes_json_still_fails_open(self):
         # Distinct from a missing file: a table we cannot read must not become a
-        # blanket blocker, so the pre-0.1.2 fail-open design stands.
+        # blanket blocker, so the pre-0.1.2 fail-open design stands. After
+        # D14 "failing open" means attached-and-passing (off short-circuits
+        # in on_acting), not detached — the guarantee is that nothing blocks.
         self._fresh_plugin_tree("{ not json")
         with self.assertLogs("dispatch_guard.qwenpaw", level="ERROR") as logs:
             self.assertEqual(dg._load_config()["mode"], "off")
-            self.assertIsNone(dg._factory(FakeCtx(self.ws), FakeCfg("default")))
+            mw = dg._factory(FakeCtx(self.ws), FakeCfg("default"))
+            self.assertIsNotNone(mw, "D14: off keeps the middleware attached")
         self.assertTrue(any("failing open" in line for line in logs.output))
+        r = run(mw, "write_file", {"file_path": "outputs/report.docx"})
+        self.assertNotEqual(r[0].state, "denied", "a broken table blocks nothing")
 
     # -- environment discovery: no owner, no block --------------------------
 
@@ -295,6 +346,20 @@ class DispatchGuardTest(unittest.TestCase):
                 encoding="utf-8",
             )
 
+    def _live_specialists(self):
+        """Every owner the shipped example table can route to, really
+        installed. Under D8 a block needs a live owner — tests that expect
+        deny/warn must run in an environment that has one, not on the
+        unreadable-inventory trust-table fallback."""
+        self._make_agents({
+            "DocAgent": ["文档"],
+            "CodeAgent": ["代码"],
+            "HardwareAgent": ["pcb"],
+            "DesignAgent": ["图"],
+            "OpsAgent": ["工单"],
+            "LifeAgent": ["打车"],
+        })
+
     def _audit_records(self):
         path = Path(self.ws) / "logs" / "dispatch_guard.jsonl"
         if not path.exists():
@@ -303,7 +368,7 @@ class DispatchGuardTest(unittest.TestCase):
 
     def test_discovery_reads_workspace_agents(self):
         self._make_agents({"DocAgent": ["文档", "报告"], "CodeAgent": ["代码"]})
-        ids = {a["id"] for a in dg._discover_agents(self.ws)}
+        ids = {a["id"] for a in dg._discover_agents(self.ws)[0]}
         self.assertEqual(ids, {"DocAgent", "CodeAgent"})
 
     def test_stale_route_to_absent_agent_stands_down(self):
@@ -323,11 +388,110 @@ class DispatchGuardTest(unittest.TestCase):
         self.assertIn("DocAgent", r[0].content[0].text)
 
     def test_empty_discovery_trusts_the_table(self):
-        # No agent manifests anywhere we can read: discovery cannot judge the
-        # deployment, so the operator's table applies verbatim (pre-discovery
-        # behaviour) instead of silently disarming the guard.
+        # D8 narrowed the trust-the-table branch to what it was always meant
+        # to cover: a FAILED walk. Emptiness there says nothing about the
+        # deployment, so the operator's table applies verbatim instead of
+        # silently disarming the guard. (A readable-empty inventory is a
+        # genuine single-agent deployment — see the two tests below.)
+        bad_root = mock.MagicMock()
+        bad_root.is_dir.return_value = True
+        bad_root.glob.side_effect = OSError(5, "Injected I/O error")
+        with mock.patch.object(
+            dg, "_discovery_roots", return_value=[Path(self.ws) / "agents", bad_root]
+        ):
+            r = run(self.mw, "write_file", {"file_path": "outputs/report.docx"})
+        self.assertEqual(r[0].state, "denied")
+
+    def test_readable_empty_inventory_stands_down(self):
+        # D8: agents/ readable with zero specialists is a single-agent
+        # deployment, and the documented promise ("no owner, no block")
+        # holds there: the routed-class write passes with a no_owner audit
+        # record instead of being denied toward agents that do not exist.
+        r = run(self.mw, "write_file", {"file_path": "outputs/report.docx"})
+        self.assertNotEqual(r[0].state, "denied")
+        self.assertEqual(self._audit_records()[-1]["action"], "no_owner")
+
+    def test_unreadable_manifest_keeps_guard_armed(self):
+        # B4: D8's readable flag meant "the glob did not raise". A manifest
+        # that exists but cannot be read was dropped by
+        # _parse_agent_manifest's OSError handler, so the empty result was
+        # reported as a genuine single-agent deployment and the guard stood
+        # down over a layout it had never actually read — the fail-open D8
+        # was meant to close, arrived at by a different route.
+        #
+        # A dangling symlink stands in for a permission wall: both surface as
+        # OSError from read_text, and this form does not depend on the uid
+        # the suite happens to run under (chmod 0o000 is a no-op for root).
+        d = Path(self.ws) / "agents" / "DocAgent"
+        d.mkdir(parents=True)
+        (d / "agent.json").symlink_to(Path(self.ws) / "agents" / "gone.json")
+        self._bust_config_cache()
+        agents, readable = dg._discover_agents(self.ws)
+        self.assertEqual(agents, [])
+        self.assertFalse(
+            readable, "an unreadable manifest is not a readable-empty inventory"
+        )
+        self._bust_config_cache()
         r = run(self.mw, "write_file", {"file_path": "outputs/report.docx"})
         self.assertEqual(r[0].state, "denied")
+
+    def test_unreadable_agent_directory_keeps_guard_armed(self):
+        # B12: one level up from B4. pathlib's glob swallows a PermissionError
+        # raised inside a subdirectory, so a permission wall on
+        # agents/DocAgent/ made the walk come back empty WITHOUT failing —
+        # and empty-plus-readable is precisely the single-agent deployment
+        # that stands down. `chmod 000 agents/X && write deliverable` was a
+        # one-line disarm.
+        #
+        # This one cannot be modelled with a symlink (a dangling symlink is
+        # legitimately not-a-directory, and skipping it is correct), so it
+        # uses a real permission wall and skips itself when the sandbox
+        # cannot enforce one.
+        d = Path(self.ws) / "agents" / "DocAgent"
+        d.mkdir(parents=True)
+        (d / "agent.json").write_text(
+            json.dumps({"id": "DocAgent", "skills": ["文档"]}), encoding="utf-8"
+        )
+        d.chmod(0o000)
+        try:
+            try:
+                with open(d / "agent.json", encoding="utf-8") as fh:
+                    fh.read()
+            except PermissionError:
+                pass  # the wall holds; proceed
+            else:
+                self.skipTest("running with permission to read a 0o000 directory")
+            self._bust_config_cache()
+            agents, readable = dg._discover_agents(self.ws)
+            self.assertFalse(
+                readable, "a walled-off subdirectory is not a readable-empty inventory"
+            )
+            self._bust_config_cache()
+            r = run(self.mw, "write_file", {"file_path": "outputs/report.docx"})
+            self.assertEqual(r[0].state, "denied")
+        finally:
+            # Restore before the temp tree is removed: addCleanup would run
+            # after tearDown's cleanup() and chmod a path that no longer
+            # exists.
+            d.chmod(0o755)
+
+    def test_unreadable_inventory_block_names_no_invented_agent(self):
+        # D8 wording rule: when the table is trusted but discovery failed
+        # and the class has no route-named owner, the deny must NOT point
+        # at the literal "对应专业 agent" — an invented dispatch target.
+        # The only valid advice is to take it back to the user.
+        self._configure({"mode": "enforce", "ext_routes": {}, "routes": []})
+        bad_root = mock.MagicMock()
+        bad_root.is_dir.return_value = True
+        bad_root.glob.side_effect = OSError(5, "Injected I/O error")
+        with mock.patch.object(
+            dg, "_discovery_roots", return_value=[Path(self.ws) / "agents", bad_root]
+        ):
+            r = run(self.mw, "write_file", {"file_path": "outputs/report.docx"})
+        self.assertEqual(r[0].state, "denied")
+        text = r[0].content[0].text
+        self.assertNotIn("对应专业 agent", text)
+        self.assertIn("用户", text)
 
     def test_specialists_exist_but_none_owns_the_class(self):
         # The motivating scenario: a real multi-agent env with no doc/design
@@ -440,7 +604,7 @@ class DispatchGuardTest(unittest.TestCase):
             encoding="utf-8",
         )
         self._bust_config_cache()
-        ids = {a["id"] for a in dg._discover_agents(self.ws)}
+        ids = {a["id"] for a in dg._discover_agents(self.ws)[0]}
         self.assertIn("DocAgent", ids)
         self.assertIn("DesignAgent", ids)
         self.assertNotIn("default", ids, "the orchestrator is never a dispatch target")
@@ -458,7 +622,7 @@ class DispatchGuardTest(unittest.TestCase):
         )
         (host / "config.json").write_text("{ not json", encoding="utf-8")
         self._bust_config_cache()
-        self.assertEqual({a["id"] for a in dg._discover_agents(self.ws)}, {"DocAgent"})
+        self.assertEqual({a["id"] for a in dg._discover_agents(self.ws)[0]}, {"DocAgent"})
 
     # -- inventory hot-reload & absolute paths -------------------------------
 
@@ -467,26 +631,31 @@ class DispatchGuardTest(unittest.TestCase):
         # added or edited mid-process must be visible on the next guarded call
         # without a host restart.
         self._make_agents({"DocAgent": ["文档"]})
-        self.assertEqual({a["id"] for a in dg._discover_agents(self.ws)}, {"DocAgent"})
+        self.assertEqual({a["id"] for a in dg._discover_agents(self.ws)[0]}, {"DocAgent"})
         self._make_agents({"CodeAgent": ["代码"]})
         self.assertEqual(
-            {a["id"] for a in dg._discover_agents(self.ws)},
+            {a["id"] for a in dg._discover_agents(self.ws)[0]},
             {"DocAgent", "CodeAgent"},
         )
 
     def test_enabled_flag_refresh_excludes_parked_agent(self):
         host = self._make_host_tree({"DocAgent": "文档"}, {"DocAgent": {"enabled": True}})
         self._bust_config_cache()
-        self.assertIn("DocAgent", {a["id"] for a in dg._discover_agents(self.ws)})
+        self.assertIn("DocAgent", {a["id"] for a in dg._discover_agents(self.ws)[0]})
         (host / "config.json").write_text(
             json.dumps({"agents": {"profiles": {"DocAgent": {"enabled": False}}}}),
             encoding="utf-8",
         )
-        self.assertNotIn("DocAgent", {a["id"] for a in dg._discover_agents(self.ws)})
+        self.assertNotIn("DocAgent", {a["id"] for a in dg._discover_agents(self.ws)[0]})
 
     def test_absolute_path_into_deliverable_dir_is_guarded(self):
         # _rel leaves absolute targets untouched, so prefix matching against
         # workspace-relative dirs never fired for them; a segment match does.
+        self._live_specialists()
+        cfg = json.loads((REPO / "routes.example.json").read_text(encoding="utf-8"))
+        cfg["mode"] = "enforce"
+        cfg["routes"].append({"match": ["quarterly"], "agent": "DocAgent"})
+        self._configure(cfg)
         r = run(self.mw, "write_file", {"file_path": "/somewhere/else/outputs/quarterly-report"})
         self.assertEqual(r[0].state, "denied")
 
@@ -626,6 +795,7 @@ class DispatchGuardTest(unittest.TestCase):
     def test_write_tools_config_extends_coverage(self):
         # Host-specific file-producing tools (code runners, downloaders) are
         # operator-known; write_tools lets routes.json cover them.
+        self._live_specialists()
         cfg = json.loads((REPO / "routes.example.json").read_text(encoding="utf-8"))
         cfg["mode"] = "enforce"
         cfg["write_tools"] = ["save_artifact"]
@@ -637,6 +807,7 @@ class DispatchGuardTest(unittest.TestCase):
         self.assertEqual(r[0].content[0].text, "ok")
 
     def test_shell_enforce_default_off_keeps_warn(self):
+        self._live_specialists()
         cfg = json.loads((REPO / "routes.example.json").read_text(encoding="utf-8"))
         cfg["mode"] = "enforce"
         self._configure(cfg)
@@ -645,6 +816,7 @@ class DispatchGuardTest(unittest.TestCase):
         self.assertNotEqual(r[0].state, "denied")
 
     def test_shell_enforce_opt_in_denies_deliverable_output(self):
+        self._live_specialists()
         cfg = json.loads((REPO / "routes.example.json").read_text(encoding="utf-8"))
         cfg["mode"] = "enforce"
         cfg["shell_enforce"] = True
@@ -672,6 +844,7 @@ class DispatchGuardTest(unittest.TestCase):
         # A copy destination is where the bytes land: warn-only by default,
         # denied with shell_enforce — closing the bypass where an agent under
         # enforce moves a generated deliverable instead of redirecting it.
+        self._live_specialists()
         cmd = {"command": "cp /tmp/gen.docx outputs/report.docx"}
         cfg = json.loads((REPO / "routes.example.json").read_text(encoding="utf-8"))
         cfg["mode"] = "enforce"
@@ -688,6 +861,7 @@ class DispatchGuardTest(unittest.TestCase):
         # A path inside a quoted string is a mention (open('outputs/x.docx'…)):
         # enough to flag, never enough to block — a grep for a filename is not
         # a write, and mention-tier denials would wedge legitimate work.
+        self._live_specialists()
         cfg = json.loads((REPO / "routes.example.json").read_text(encoding="utf-8"))
         cfg["mode"] = "enforce"
         cfg["shell_enforce"] = True
@@ -703,6 +877,7 @@ class DispatchGuardTest(unittest.TestCase):
     def test_pathless_write_tools_are_scanned_not_skipped(self):
         # Declaring a code-runner-style tool in write_tools without scanning
         # its input body would be a fake coverage: the path lives in the code.
+        self._live_specialists()
         cfg = json.loads((REPO / "routes.example.json").read_text(encoding="utf-8"))
         cfg["mode"] = "enforce"
         cfg["write_tools"] = ["run_python"]
@@ -721,6 +896,7 @@ class DispatchGuardTest(unittest.TestCase):
     def test_bare_string_path_input_still_counts_as_path(self):
         # Host variants of write tools may pass the path as a bare string;
         # that is an explicit target, not a mention.
+        self._live_specialists()
         r = run(self.mw, "write_file", "outputs/report.docx")
         self.assertEqual(r[0].state, "denied")
 
@@ -746,6 +922,7 @@ class DispatchGuardTest(unittest.TestCase):
     def test_traversal_escape_cannot_dress_as_whitelist(self):
         # notes/../../outputs/escape.docx lands OUTSIDE the workspace; the raw
         # spelling's "notes/" prefix must not whitelist the real destination.
+        self._live_specialists()
         self._host_plugin_tree()
         r = run(self.mw, "write_file", {"file_path": "notes/../../outputs/escape.docx"})
         self.assertEqual(r[0].state, "denied")
@@ -753,6 +930,7 @@ class DispatchGuardTest(unittest.TestCase):
         self.assertEqual(r[0].state, "denied")
 
     def test_traversal_escape_through_shell_is_seen(self):
+        self._live_specialists()
         self._host_plugin_tree({"shell_enforce": True})
         r = run(
             self.mw,
@@ -763,6 +941,7 @@ class DispatchGuardTest(unittest.TestCase):
 
     def test_traversal_staying_inside_ws_is_normalized(self):
         # notes/../outputs/inws.docx is the same file as outputs/inws.docx.
+        self._live_specialists()
         self._host_plugin_tree()
         r = run(self.mw, "write_file", {"file_path": "notes/../outputs/inws.docx"})
         self.assertEqual(r[0].state, "denied")
@@ -803,7 +982,7 @@ class DispatchGuardTest(unittest.TestCase):
             (host / "config.json").write_text(bad, encoding="utf-8")
             self._bust_config_cache()
             self.assertEqual(
-                {a["id"] for a in dg._discover_agents(self.ws)},
+                {a["id"] for a in dg._discover_agents(self.ws)[0]},
                 {"DocAgent"},
                 bad,
             )
@@ -811,6 +990,7 @@ class DispatchGuardTest(unittest.TestCase):
     def test_wrong_typed_ext_routes_degrades_not_crashes(self):
         # The first call failed open and every later call crashed with
         # AttributeError: the poisoned cache outlived the load-time guard.
+        self._live_specialists()
         cfg = json.loads((REPO / "routes.example.json").read_text(encoding="utf-8"))
         cfg["mode"] = "enforce"
         cfg["ext_routes"] = ["oops"]
@@ -821,6 +1001,11 @@ class DispatchGuardTest(unittest.TestCase):
             self.assertEqual(r[0].state, "denied")
 
     def test_wrong_typed_routes_and_null_ext_routes_degrade(self):
+        # Poisoned routes + null ext_routes degrade to "no usable rules"
+        # instead of crashing: every deliverable class then has no route and
+        # stands down with a no_owner record (D8 semantics — an unrouted
+        # class in a readable environment never blocks).
+        self._live_specialists()
         cfg = json.loads((REPO / "routes.example.json").read_text(encoding="utf-8"))
         cfg["mode"] = "enforce"
         cfg["routes"] = "abc"
@@ -829,7 +1014,7 @@ class DispatchGuardTest(unittest.TestCase):
         self._bust_config_cache()
         for _ in range(2):
             r = run(self.mw, "write_file", {"file_path": "outputs/a.docx"})
-            self.assertEqual(r[0].state, "denied")
+            self.assertNotEqual(r[0].state, "denied")
 
     def test_route_rule_with_non_array_match_keeps_other_rules(self):
         cfg = json.loads((REPO / "routes.example.json").read_text(encoding="utf-8"))
@@ -851,6 +1036,7 @@ class DispatchGuardTest(unittest.TestCase):
 
     def test_shell_ffmpeg_positional_output_is_seen(self):
         # ffmpeg has no -o flag; its output is the trailing positional token.
+        self._live_specialists()
         r = run(self.mw, "execute_shell_command", {"command": "ffmpeg -i clip.mov clip.mp4"})
         self.assertEqual(len(r[0].content), 2)
         self.assertIn("dispatch-guard warn", r[0].content[1].text)
@@ -861,16 +1047,27 @@ class DispatchGuardTest(unittest.TestCase):
         self.assertEqual(len(r[0].content), 1)
 
     def test_shell_ffmpeg_multi_input_last_token_is_output(self):
+        self._live_specialists()
         r = run(self.mw, "execute_shell_command", {"command": "ffmpeg -y -i a.mov -i b.mov out.mp4"})
         self.assertEqual(len(r[0].content), 2)
 
     def test_shell_converter_outdir_is_seen(self):
+        self._live_specialists()
+        cfg = json.loads((REPO / "routes.example.json").read_text(encoding="utf-8"))
+        cfg["mode"] = "enforce"
+        cfg["routes"].append({"match": ["outputs"], "agent": "DocAgent"})
+        self._configure(cfg)
         r = run(self.mw, "execute_shell_command", {
             "command": "soffice --headless --convert-to docx --outdir outputs report.odt"
         })
         self.assertEqual(len(r[0].content), 2)
 
     def test_deliverable_directory_itself_is_a_target(self):
+        self._live_specialists()
+        cfg = json.loads((REPO / "routes.example.json").read_text(encoding="utf-8"))
+        cfg["mode"] = "enforce"
+        cfg["routes"].append({"match": ["outputs"], "agent": "DocAgent"})
+        self._configure(cfg)
         r = run(self.mw, "execute_shell_command", {"command": "soffice --outdir=outputs/ x.odt"})
         self.assertEqual(len(r[0].content), 2)
 
@@ -903,8 +1100,9 @@ class DispatchGuardTest(unittest.TestCase):
         with mock.patch.object(
             dg, "_discovery_roots", return_value=[Path(self.ws) / "agents", bad_root]
         ):
-            agents = dg._discover_agents(self.ws)
+            agents, readable = dg._discover_agents(self.ws)
         self.assertEqual([a["id"] for a in agents], ["DocAgent"])
+        self.assertFalse(readable, "a failed walk must report unreadable (D8)")
         self.assertIsNone(dg._AGENTS_CACHE["agents"], "partial inventory must not be cached")
 
     # -- private config survives the installer rebuilding the plugin dir -----
