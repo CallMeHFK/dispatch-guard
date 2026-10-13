@@ -38,6 +38,7 @@ Every interception is appended to ``<workspace>/logs/dispatch_guard.jsonl``.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -544,6 +545,31 @@ def _canonical_target(p: str) -> str:
     the original string; only the judgment form is canonicalized.
     """
     return p.strip().rstrip(".")
+
+
+# D10: the spawn backstop's denial record used to carry the tool input
+# verbatim — task text routinely embeds API keys and bearer tokens, and the
+# audit log's readership is wider than the credential holders'. The record
+# now carries only a hash (identity/dedup), the length, and a redacted
+# excerpt; raw input never reaches the jsonl.
+_SECRET_PATTERNS = (
+    re.compile(r"\bsk-[A-Za-z0-9_-]{4,}"),
+    re.compile(
+        r"(?i)\b(?:api[_-]?key|access[_-]?token|token|secret|passw(?:ord|ork)|"
+        r"bearer|authorization)\b\s*[:=]\s*[^\s,;\"']+"
+    ),
+)
+
+
+def _spawn_audit_target(raw: str) -> str:
+    """Digest form of a spawn denial's target for the audit trail (D10)."""
+    text = raw if isinstance(raw, str) else str(raw)
+    redacted = text
+    for pat in _SECRET_PATTERNS:
+        redacted = pat.sub("[redacted]", redacted)
+    digest = hashlib.sha256(text.encode("utf-8", "replace")).hexdigest()[:16]
+    excerpt = redacted[:80]
+    return f"sha256:{digest} len:{len(text)} excerpt:{excerpt!r}"
 
 
 def _deliverable_exts(cfg: dict[str, Any]) -> frozenset[str]:
@@ -1427,7 +1453,9 @@ class DispatchGuardMiddleware(MiddlewareBase):
                 "spawn_subagent 已停用（配置层禁用）。盲评或并行 worker 请用 "
                 "chat_with_agent / submit_to_agent 派给专业 agent。",
                 name,
-                target,
+                # D10: the spawn input body is not audit-log material — task
+                # text carries credentials, and the log outlives the call.
+                _spawn_audit_target(target if isinstance(target, str) else str(target)),
                 mode,
             )
             return

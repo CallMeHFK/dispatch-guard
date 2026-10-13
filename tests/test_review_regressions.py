@@ -380,6 +380,21 @@ class ReviewRegressionTest(unittest.TestCase):
         r = run(self.mw, "write_file", {"file_path": "artifacts/widget"})
         self.assertEqual(r[0].state, "denied", "the real entry still applies")
 
+    # -- D10: spawn denial must not persist the task text verbatim -----------
+
+    def test_spawn_denial_is_digest_not_verbatim(self):
+        # review D10: the spawn backstop logged json.dumps(input) into the
+        # audit trail — task text carries credentials and the log outlives
+        # the call. Record now: sha256[:16] + length + redacted excerpt.
+        secret = "sk-LIVE-TOKEN-9f2b"
+        r = run(self.mw, "spawn_subagent", {"task": f"use {secret} now"})
+        self.assertEqual(r[0].state, "denied")
+        log = Path(self.ws) / "logs" / "dispatch_guard.jsonl"
+        text = log.read_text(encoding="utf-8")
+        self.assertNotIn(secret, text)
+        self.assertIn("sha256:", text)
+        self.assertIn("[redacted]", text)
+
 
 if __name__ == "__main__":
     unittest.main()
