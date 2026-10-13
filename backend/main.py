@@ -968,6 +968,19 @@ def _discover_agents(ws: str | Path) -> tuple[list[dict[str, Any]], bool]:
             if not root.is_dir():
                 continue
             manifests = sorted(root.glob("*/agent.json")) + sorted(root.glob("agent.json"))
+            if not manifests:
+                # pathlib's glob swallows a PermissionError raised inside a
+                # subdirectory, so a wall one level down (chmod 000
+                # agents/DocAgent) makes the walk come back empty WITHOUT
+                # failing — and empty-plus-readable is exactly the
+                # single-agent verdict that stands down. Before calling an
+                # empty walk readable, verify every immediate subdirectory
+                # can actually be entered (B12); the check only runs on the
+                # empty path, so it costs nothing for real inventories.
+                for entry in root.iterdir():
+                    if not entry.is_dir():
+                        continue
+                    next(entry.iterdir(), None)  # raises PermissionError on a wall
             for manifest in manifests:
                 parsed = _parse_agent_manifest(manifest)
                 if parsed and parsed["id"] not in found:

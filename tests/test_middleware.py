@@ -435,6 +435,46 @@ class DispatchGuardTest(unittest.TestCase):
         r = run(self.mw, "write_file", {"file_path": "outputs/report.docx"})
         self.assertEqual(r[0].state, "denied")
 
+    def test_unreadable_agent_directory_keeps_guard_armed(self):
+        # B12: one level up from B4. pathlib's glob swallows a PermissionError
+        # raised inside a subdirectory, so a permission wall on
+        # agents/DocAgent/ made the walk come back empty WITHOUT failing —
+        # and empty-plus-readable is precisely the single-agent deployment
+        # that stands down. `chmod 000 agents/X && write deliverable` was a
+        # one-line disarm.
+        #
+        # This one cannot be modelled with a symlink (a dangling symlink is
+        # legitimately not-a-directory, and skipping it is correct), so it
+        # uses a real permission wall and skips itself when the sandbox
+        # cannot enforce one.
+        d = Path(self.ws) / "agents" / "DocAgent"
+        d.mkdir(parents=True)
+        (d / "agent.json").write_text(
+            json.dumps({"id": "DocAgent", "skills": ["文档"]}), encoding="utf-8"
+        )
+        d.chmod(0o000)
+        try:
+            try:
+                with open(d / "agent.json", encoding="utf-8") as fh:
+                    fh.read()
+            except PermissionError:
+                pass  # the wall holds; proceed
+            else:
+                self.skipTest("running with permission to read a 0o000 directory")
+            self._bust_config_cache()
+            agents, readable = dg._discover_agents(self.ws)
+            self.assertFalse(
+                readable, "a walled-off subdirectory is not a readable-empty inventory"
+            )
+            self._bust_config_cache()
+            r = run(self.mw, "write_file", {"file_path": "outputs/report.docx"})
+            self.assertEqual(r[0].state, "denied")
+        finally:
+            # Restore before the temp tree is removed: addCleanup would run
+            # after tearDown's cleanup() and chmod a path that no longer
+            # exists.
+            d.chmod(0o755)
+
     def test_unreadable_inventory_block_names_no_invented_agent(self):
         # D8 wording rule: when the table is trusted but discovery failed
         # and the class has no route-named owner, the deny must NOT point
