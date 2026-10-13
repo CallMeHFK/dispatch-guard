@@ -384,6 +384,60 @@ class ReviewRegressionTest(unittest.TestCase):
         r = run(self.mw, "write_file", {"file_path": "artifacts/widget"})
         self.assertEqual(r[0].state, "denied", "the real entry still applies")
 
+    # -- D1 shell arm: shell text mentioning the guard's own table ---------
+
+    _GUARD_TABLE_CFG = {
+        "mode": "enforce",
+        "ext_routes": {".docx": "DocAgent"},
+        "routes": [],
+    }
+
+    def test_shell_mention_of_guard_table_is_denied(self):
+        # review D1-shell: the write-tool branch denied explicit guard-table
+        # targets, but `sed -i`/`tee`/redirects past routes.json sailed
+        # through — the one bypass that un-does every other rule. Any shell
+        # mention is intercepted, in any spelling of the two live homes.
+        self._write_config(dict(self._GUARD_TABLE_CFG))
+        plugin_table = str(dg.PLUGIN_DIR / "routes.json")
+        variants = [
+            f"echo '{{\"mode\":\"off\"}}' > {plugin_table}",
+            f"sed -i s/enforce/off/ {plugin_table}",
+            f"cat /etc/hosts | tee {plugin_table}",
+            "rm -f routes.json",
+            "cp backup/routes.draft.json ./routes.json",
+            f"python -c \"open(r'{plugin_table}','w').write(x)\"",
+        ]
+        for cmd in variants:
+            with self.subTest(cmd=cmd):
+                r = run(self.mw, "execute_shell_command", {"command": cmd})
+                self.assertEqual(r[0].state, "denied")
+
+    def test_guard_table_mention_warns_not_denies_outside_enforce(self):
+        cfg = dict(self._GUARD_TABLE_CFG)
+        cfg["mode"] = "warn"
+        self._write_config(cfg)
+        r = run(
+            self.mw,
+            "execute_shell_command",
+            {"command": f"cat {dg.PLUGIN_DIR / 'routes.json'}"},
+        )
+        self.assertNotEqual(r[0].state, "denied", "mention level outside enforce")
+        self.assertEqual(len(r[0].content), 2, "warn block must be appended")
+
+    def test_guard_table_mention_lookalikes_stay_innocent(self):
+        # routes.example.json is the shipped sanitized table; a boundary-
+        # anchored regex must not fire on it or on "myroutes.json".
+        self._write_config(dict(self._GUARD_TABLE_CFG))
+        for cmd in (
+            "cp routes.example.json myroutes.json",
+            "cat myroutes.json",
+            "grep -r dispatch routes.example.json",
+        ):
+            with self.subTest(cmd=cmd):
+                r = run(self.mw, "execute_shell_command", {"command": cmd})
+                self.assertNotEqual(r[0].state, "denied")
+                self.assertEqual(len(r[0].content), 1, f"silent for {cmd!r}")
+
     # -- D10: spawn denial must not persist the task text verbatim -----------
 
     def test_spawn_denial_is_digest_not_verbatim(self):

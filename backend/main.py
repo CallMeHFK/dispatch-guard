@@ -148,6 +148,19 @@ WHITELIST_FILES = {
 # observes (D1 — meta-integrity, not deliverable routing).
 _GUARD_CONFIG_NAMES = frozenset({"routes.json", "routes.draft.json"})
 
+# D1 (shell arm): the write-tool branch denies explicit guard-table targets,
+# but the same routes.json is one `sed -i` / `tee` / `> redirect` away from
+# being rewritten through execute_shell_command — the one bypass that would
+# undo every other rule. ANY shell command whose text mentions the guard's
+# own table paths (plugin tree or plugin-data mirror — both end in these
+# basenames) is intercepted at mention level in every mode the middleware
+# observes: denied under enforce (meta-integrity is not a routing question),
+# warned elsewhere. The regex is boundary-anchored so "myroutes.json" and
+# the innocent "routes.example.json" do not match.
+_GUARD_CONFIG_MENTION_RE = re.compile(
+    r"(?:\b|^)(?:routes\.draft\.json|routes\.json)(?![\w.-])"
+)
+
 # Command-line shapes that name an output FILE (redirect, tee, an output
 # flag, or the destination of cp/mv/rsync/install). Whether that file is a
 # deliverable is decided by _is_deliverable(), not here — so a redirect into
@@ -1581,6 +1594,30 @@ class DispatchGuardMiddleware(MiddlewareBase):
                 )
             else:
                 cmd = str(raw_input)
+            # D1 (shell arm): a command that MENTIONS the guard's own table
+            # is treated as meta-integrity, not routing — denied under
+            # enforce, warned in every other observed mode, before the
+            # deliverable scan even runs.
+            mention = _GUARD_CONFIG_MENTION_RE.search(cmd)
+            if mention:
+                note = (
+                    f"dispatch-guard 元完整性：命令中提到本守卫的派发表 "
+                    f"{mention.group(0)}（D1）。routes.json/routes.draft.json "
+                    "只能由操作员在会话外维护；agent 经由 shell 触碰它们"
+                    "（重定向、tee、sed -i、rm 等任意形式）一律按提及级拦截。"
+                )
+                if mode == "enforce":
+                    yield self._deny(note + " 目标命令已拒绝。", name, mention.group(0), mode)
+                    return
+                async for event in self._warn_and_pass(
+                    f"[dispatch-guard warn] {note}",
+                    name,
+                    mention.group(0),
+                    mode,
+                    next_handler,
+                ):
+                    yield event
+                return
             found = self._scan_candidates(cmd, cfg)
             if found:
                 rel, explicit = found[0]
