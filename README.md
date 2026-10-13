@@ -160,10 +160,14 @@ a route whose agent does not exist — or a deliverable class no discovered
 agent owns — is never blocked, just recorded as `no_owner` in the audit log.
 A *readable* inventory with zero specialists is treated for what it is — a
 single-agent deployment, every class `no_owner` — and only an inventory the
-guard could not read at all falls back to trusting the operator's table
-verbatim (a broken walk must not disarm the guard, and it is the one place
-where an unrouted deliverable can still be blocked — the block then points
-at the user, never at an invented agent):
+guard could not read falls back to trusting the operator's table verbatim.
+"Could not read" covers a failed glob **and** any manifest that exists but
+cannot be opened: a permission wall must not be able to report itself as
+"this deployment has no specialists". (A manifest that opens and turns out to
+be malformed is a different case — it is read, it just describes no agent, and
+it stays non-fatal.) This is the one place where an unrouted deliverable can
+still be blocked, and the block then points at the user, never at an invented
+agent:
 
 | Tool call | `enforce` | `warn` | `unconfigured` | `off` |
 |---|---|---|---|---|
@@ -171,7 +175,7 @@ at the user, never at an invented agent):
 | `write_file` / `edit_file` / `append_file` to a **basic** target (whitelisted paths, notes, scripts, configs, scratch, extension-less files — anything not deliverable-shaped) | **Passes untouched**, not even logged | same | same | attached; passes unexamined |
 | `write_file` / `edit_file` / `append_file` to a **deliverable-shaped** target whose owner does not exist here (route names an absent agent, or no discovered agent owns the class) | **Passes untouched**; `no_owner` audit record | same | same | attached; passes unexamined |
 | `write_file` / `edit_file` / `append_file` to a **deliverable-shaped** target outside the whitelist, owned by a **live** agent (under `outputs/`, `projects/`, or carrying a deliverable extension — see [Configuration](#configuration)) | **Denied** — "该产出属于 {agent} 域…请用 `submit_to_agent` 派发给 {agent}" | Passes, warning block appended to the `ToolResponse` | Passes, setup block appended (never denies: there is no table to judge ownership from) | Attached; passes unexamined |
-| `execute_shell_command` naming a deliverable-shaped output file with a live owner (redirects `>`/`>>`/`>|`, `tee` including long options, `curl`/`wget` outputs, `dd of=`, `zip`/`tar` creation, compiler `-o`, `sed`/`perl -i` in-place edits, converter `-o`/`--outdir`, `cp`/`mv` destinations, ffmpeg positional output) | Passes, warning block — shell heuristics **never block** unless `shell_enforce` is on, in which case the unambiguous shapes are denied (status checks must stay cheap). Exception: a command that mentions the guard's own `routes.json`/`routes.draft.json` is intercepted in every mode (meta-integrity, see below) | same | same, with the setup block | attached; passes unexamined |
+| `execute_shell_command` naming a deliverable-shaped output file with a live owner (redirects `>`/`>>`/`>|`, `tee` including long options, `curl`/`wget` outputs, `dd of=`, `zip`/`tar` creation, compiler `-o`, `sed`/`perl -i` in-place edits, converter `-o`/`--outdir`, `cp`/`mv` destinations, ffmpeg positional output) | Passes, warning block — shell heuristics **never block** unless `shell_enforce` is on, in which case the unambiguous shapes are denied (status checks must stay cheap). Exception, and not a heuristic: a command naming one of the guard's own table **paths** warns, and one that mutates it is denied in every mode — `shell_enforce` does not apply (meta-integrity, see below). A project's own `routes.json` is never matched | same | same, with the setup block | attached; passes unexamined |
 | `spawn_subagent` / `spawn_agent` | **Denied** (backstop for the config-layer disable) | denied | denied | attached; passes unexamined |
 
 Mode is re-read from `routes.json` on every tool call and cached by file
@@ -211,11 +215,17 @@ operation are invisible to the guard, in all modes:
 - the plugin tree itself (the guard must not block its own maintainer;
   **absolute paths only**, so workspace-relative paths can never accidentally
   resolve into it) — **except the guard's own dispatch tables**:
-  `routes.json`/`routes.draft.json` are never whitelisted, writes to them are
-  denied in every mode the middleware observes, and a shell command whose
-  text merely mentions them is intercepted at mention level (enforce denies,
-  other modes warn). The table is what the guard is made of; the guarded
-  agent must not hold the eraser.
+  `routes.json`/`routes.draft.json` are never whitelisted, and a write to
+  either real table is refused in every mode the middleware observes, `off`
+  included, whichever shape the path arrives in — a plain string, a list or
+  dict value, an upper-case or trailing-dot spelling. Through
+  `execute_shell_command` the same two files are matched **by their real
+  path** (plugin directory or plugin-data mirror): naming one warns, mutating
+  one — a redirect, `tee`, `sed -i`, `rm`/`mv`/`truncate`, an in-process
+  `open(..., "w")` — is refused. Bare basenames are never matched, so a
+  project that owns its own `routes.json` can still read, grep, copy and
+  delete it. The table is what the guard is made of; the guarded agent must
+  not hold the eraser.
 - any other non-deliverable write: notes, scripts, configs, scratch and
   extension-less files anywhere in the workspace
 
@@ -309,9 +319,15 @@ measuring how often the orchestrator still tries to self-execute after
 prompt fixes. Shell records hold only the extracted paths and hint text —
 never the raw command line. Spawn denials (whose input is free-form task
 text that routinely embeds API keys) are recorded as a digest: sha256[:16],
-length, and a credential-redacted excerpt — the verbatim task never reaches
-the log. Other records contain real tool targets, so still sanitize before
-attaching one to an issue.
+length, and a credential-redacted excerpt, so the task text itself is not in
+the log. A tool call whose shape the guard cannot parse gets the same digest
+— that path used to log the raw structure verbatim, which is exactly where a
+credential would have landed. The redaction is a known-shape filter (`sk-…`,
+AWS access key ids, `Bearer …`, `key=value` and `key is value` assignments),
+not a secret scanner: a credential in some other spelling can still appear in
+the excerpt, which is why the excerpt is capped and the hash, not the text,
+is the record's identity. Other records contain real tool targets, so still
+sanitize before attaching one to an issue.
 
 ## Troubleshooting
 
@@ -402,13 +418,14 @@ asset.) Pushing a `v*` tag by hand still works as the manual path.
 
 No network calls, no telemetry. What the plugin writes on the local machine:
 interception records in `<workspace>/logs/dispatch_guard.jsonl` (tool targets
-and hint text — shell command lines verbatim are never stored, spawn task
-text is stored only as a hash + credential-redacted excerpt), the operator's
-draft `routes.draft.json`, and the reinstall-proof mirror of `routes.json`
-under `<host>/plugin-data/dispatch-guard/`. The dispatch tables themselves
-name your real agents and internal keywords — treat them as private state:
-they are gitignored, never packaged, and the guarded agent is denied any
-write to them (plugin tree, plugin-data mirror, or via shell).
+and hint text — shell command lines are never stored verbatim, and free-form
+task text arrives only as a hash plus a credential-redacted excerpt; see the
+audit-log note above for what that redaction does and does not catch), the
+operator's draft `routes.draft.json`, and the reinstall-proof mirror of
+`routes.json` under `<host>/plugin-data/dispatch-guard/`. The dispatch tables
+themselves name your real agents and internal keywords — treat them as
+private state: they are gitignored, never packaged, and the guarded agent is
+denied any write to them (plugin tree, plugin-data mirror, or via shell).
 
 ## Changelog
 

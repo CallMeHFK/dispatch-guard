@@ -2,6 +2,14 @@
 
 ## Unreleased — v0.1.9 评审修复 (review-20261012)
 
+<!-- Not a `## vX.Y.Z` heading on purpose. tests/test_release_hygiene.py
+     requires the newest versioned section to equal plugin.json's version, and
+     the version bump was deferred to the maintainer, so a versioned heading
+     here would fail that gate. packaging/release_notes.py can only address a
+     versioned section: when this ships, rename the heading to `## vX.Y.Z` and
+     bump plugin.json in the same change, which is what CONTRIBUTING asks for
+     and what the hygiene test enforces. -->
+
 Adversarial review 2026-10-12 (`review-20261012.md`) found 17 defects
 (D1–D17) plus fail-open consistency items (F1–F18). Every fix landed on
 `fix/review-20261012`; the review's 12-case evidence pack now passes 12/12,
@@ -9,11 +17,15 @@ and the repository suite covers every finding with targeted regression tests.
 
 - **D1 (Blocker) — the guarded agent can no longer rewrite its own dispatch
   table.** `routes.json`/`routes.draft.json` basenames are excluded from
-  every whitelist (the plugin tree included), writes to either home are
-  denied in every mode, and only lint-clean tables mirror into plugin-data.
-  Extended to the shell arm (D1-shell): a command whose text mentions the
-  guard's tables is intercepted at mention level — denied under enforce,
-  warned in every other observed mode.
+  every whitelist (the plugin tree included), a write to either home is
+  refused in every mode the middleware observes — `off` included, and
+  whichever shape the path arrives in (string, list, dict, upper-case,
+  trailing dot) — and only lint-clean tables mirror into plugin-data.
+  The shell arm (D1-shell) matches the guard's two **real table paths**, not
+  the bare basename: naming one warns, mutating one (redirect, `tee`,
+  `sed -i`, `rm`/`mv`/`truncate`, an in-process `open(..., "w")`) is refused
+  in every mode and regardless of `shell_enforce`. A project's own
+  `routes.json` is never matched, so reading or grepping it stays untouched.
 - **D2 — dict-shaped `tool_call` no longer disarms the guard.** `on_acting`
   accepts Mapping-shaped calls; an unrecognizable shape is audited and
   spawn-suspect payloads are refused under the most conservative reading.
@@ -29,23 +41,35 @@ and the repository suite covers every finding with targeted regression tests.
 - **D6 — shell redirects `>|` (noclobber) and `tee` long options
   (`--append`) are visible targets.**
 - **D7 — downloader/archiver/compiler/in-place-editor outputs are covered**:
-  `curl -o/-O`, `wget -O`/`--output-document`, `dd of=`, `zip`/`tar`
-  creation (dash-free `tar czf` included), `gcc`/`clang` `-o` in split and
-  joined form, generic `--outdir`/`--output`, and `sed`/`perl -i` rewriting
-  their trailing file argument. Read shapes (`tar xf`, `sed -n`,
-  `ffmpeg -i`) stay silent.
+  `curl -o/-O`, `wget -O`/`--output-document`, `dd of=`, `zip`/`tar` creation
+  (short bundle `tar czf`/`tar cf` and long `--create --file[=]`), compiler
+  `-o` for `gcc`/`g++`/`clang`/`clang++`/`cc`/`c++` in split and joined form,
+  short output flags with the value joined (`curl -oFILE`), generic
+  `--outdir`/`--output`, and `sed`/`perl -i` rewriting their trailing file
+  argument. Read shapes (`tar xf`, `tar tf`, `sed -n`, `ffmpeg -i`), `find`'s
+  `-o` operator and non-deliverable `-o` targets stay silent.
 - **D8 — zero-agent environments now match the documented promise.** A
   readable-but-empty inventory is a genuine single-agent deployment: every
-  class is `no_owner`, writes pass with an audit record. Only a failed
-  discovery walk keeps trusting the operator's table. Deny text never
-  points at an invented "对应专业 agent" — an unresolvable owner is handed
-  back to the user.
+  class is `no_owner`, writes pass with an audit record. Discovery keeps
+  trusting the operator's table only when it could not read the layout — the
+  walk failed, **or a manifest exists but could not be opened**: a permission
+  wall used to parse to nothing and report itself as "no specialists here",
+  disarming the guard. Deny text never points at an invented "对应专业
+  agent" — an unresolvable owner is handed back to the user.
 - **D9 — extension perturbation cannot erase routing.** Trailing dots and
-  whitespace are canonicalized before deliverable and route decisions:
-  `report.docx.` routes as `report.docx`.
-- **D10 — spawn denial audit records are digests**: sha256[:16] + length + a
-  credential-redacted excerpt (`sk-*`, token/secret/password assignments).
-  Verbatim task text no longer reaches the jsonl.
+  whitespace are canonicalized to a fixed point before deliverable and route
+  decisions, and `_whitelisted` canonicalizes through the same function:
+  `report.docx.` routes as `report.docx`, and so does `report.docx .`, whose
+  alternating dot-and-space ending used to survive a single strip-then-rstrip
+  pass and match nothing at all — silently, with no audit record.
+- **D10 — free-form task text is logged as a digest, not verbatim**:
+  sha256[:16] + length + an excerpt filtered for known credential shapes
+  (`sk-*`, AWS access key ids, `Bearer …`, `key=value` and `key is value`
+  assignments). This covers the spawn backstop **and** a tool call whose shape
+  the guard cannot parse, which is the path that used to write the raw
+  structure — credential included — straight into the jsonl. The filter is not
+  a secret scanner: a credential in an unrecognised spelling can still appear
+  in the capped excerpt.
 - **D11 — a legitimate path key no longer closes the scan of the rest of the
   input.** Deliverables hidden in other arguments earn a mention-level
   warning (never a deny from that tier).
@@ -71,12 +95,18 @@ and the repository suite covers every finding with targeted regression tests.
   it is host-logged, audited, and failed open with a visible warning block
   (the never-wedge rule), and a tool whose response already started is
   never re-run.
-- Documentation synced to the implementation (README, plugin.json
-  `meta.notes`): off semantics and hot-reload, the shell coverage families,
-  the no-owner rule, last-known-good fail-open, case-insensitive matching,
-  and audit redaction. `docs/DESIGN.md` was not in the adjudicated file
-  scope for this branch; its stale root-`.pdf` claim (§8.3 item 1) remains
-  open.
+- Documentation synced to the implementation. `docs/DESIGN.md`: the
+  "no owner, no block" asymmetry is now the three-state rule the code
+  implements (specialists found / readable-empty / unreadable), "fail-open"
+  describes the last-known-good fallback and names the guard's own table as
+  the second exception, the shell tiers carry the meta-integrity exception,
+  and the stale root-level `.pdf` claim (`review-20261012.md` §8.3 item 1) is
+  corrected — `reports/q3.pdf` is deliverable, `.pdf` being a default
+  extension, and was never passed. README and plugin.json `meta.notes`: off
+  semantics and hot-reload, the shell coverage families, the no-owner rule,
+  last-known-good
+  fail-open, case-insensitive matching, the guard-table path matching, and
+  what audit redaction does and does not catch.
 
 ## v0.1.9
 
