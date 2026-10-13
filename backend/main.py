@@ -148,17 +148,29 @@ WHITELIST_FILES = {
 # observes (D1 — meta-integrity, not deliverable routing).
 _GUARD_CONFIG_NAMES = frozenset({"routes.json", "routes.draft.json"})
 
-# D1 (shell arm): the write-tool branch denies explicit guard-table targets,
-# but the same routes.json is one `sed -i` / `tee` / `> redirect` away from
-# being rewritten through execute_shell_command — the one bypass that would
-# undo every other rule. ANY shell command whose text mentions the guard's
-# own table paths (plugin tree or plugin-data mirror — both end in these
-# basenames) is intercepted at mention level in every mode the middleware
-# observes: denied under enforce (meta-integrity is not a routing question),
-# warned elsewhere. The regex is boundary-anchored so "myroutes.json" and
-# the innocent "routes.example.json" do not match.
-_GUARD_CONFIG_MENTION_RE = re.compile(
-    r"(?:\b|^)(?:routes\.draft\.json|routes\.json)(?![\w.-])"
+# D1 (shell arm), narrowed by B1: the write-tool branch refuses explicit
+# guard-table targets, but the same file is one redirect / `tee` / `sed -i` /
+# `open(..., "w")` away through execute_shell_command — the one bypass that
+# would undo every other rule.
+#
+# The arm keys on the guard's own REAL table paths (plugin directory and
+# plugin-data mirror; absolute, resolved, and ~-compressed), never on the bare
+# basename. Matching the basename denied every read of every file called
+# routes.json — `cat src/routes.json`, `grep -n docx routes.json`, even
+# `rm -rf /tmp/x # routes.json` — which breaks any project that owns one,
+# this repository included. A relative spelling also cannot reach a plugin
+# directory outside the workspace, so the basename was never the threat.
+#
+# Two tiers, the ones DESIGN.md defines: naming one of those paths is a
+# warning, mutating it is a refusal. The mutate test below is deliberately
+# coarse — a destructive verb or a write-intent marker anywhere in a command
+# that already names the guard's own table — because past that point the
+# command has no innocent reading left.
+_GUARD_TABLE_MUTATE_RE = re.compile(
+    r"(?:^|[\s;&|(])(?:rm|mv|truncate|unlink|shred|dd|chmod|chown)(?!\w)"
+    r"|\bopen\s*\([^)]*['\"][wax]"
+    r"|\.write\s*\(",
+    re.I,
 )
 
 # Command-line shapes that name an output FILE (redirect, tee, an output
@@ -651,6 +663,17 @@ def _redacted_audit_target(raw: str) -> str:
     digest = hashlib.sha256(text.encode("utf-8", "replace")).hexdigest()[:16]
     excerpt = redacted[:80]
     return f"sha256:{digest} len:{len(text)} excerpt:{excerpt!r}"
+
+
+def _shell_command(raw_input: Any) -> str:
+    """The command line of a shell tool call, whatever shape it arrives in."""
+    if isinstance(raw_input, dict):
+        return str(
+            raw_input.get("command")
+            or raw_input.get("cmd")
+            or json.dumps(raw_input, ensure_ascii=False)
+        )
+    return str(raw_input)
 
 
 def _strings_in(value: Any, depth: int = 0) -> Iterator[str]:
@@ -1251,19 +1274,68 @@ class DispatchGuardMiddleware(MiddlewareBase):
                 continue
         return False
 
-    def _guard_config_write(self, name: str, raw_input: Any, cfg: dict[str, Any]) -> str | None:
-        """The guard table this call would write, or None (D1).
+    def _guard_table_paths(self) -> tuple[str, ...]:
+        """Every real spelling of the guard's own dispatch tables (D1).
 
-        Walks every string in the input rather than only the recognised path
-        argument: gating on ``target_is_path`` meant a list- or dict-valued
-        ``file_path`` — the D3 shape — skipped the meta-integrity check
-        entirely and the write went through.
+        Both live homes (the plugin directory and the reinstall-proof
+        plugin-data mirror), absolute and resolved, plus the ``~``-compressed
+        form an operator or an agent is most likely to type. A shell command
+        has to name one of these to be touching the guard's authority — that
+        is what keeps the check off a project's own ``routes.json``.
         """
-        if name not in _write_tools(cfg):
+        home = str(Path.home())
+        out: list[str] = []
+        for root in (PLUGIN_DIR, _data_dir()):
+            for name in sorted(_GUARD_CONFIG_NAMES):
+                p = Path(root) / name
+                try:
+                    rp = p.resolve()
+                except (OSError, ValueError, RuntimeError):
+                    rp = Path(os.path.normpath(str(p)))
+                for form in (str(p), str(rp)):
+                    if not form:
+                        continue
+                    for spelling in (form, *(
+                        ("~" + form[len(home):],) if form.startswith(home + os.sep) else ()
+                    )):
+                        if spelling not in out:
+                            out.append(spelling)
+        return tuple(out)
+
+    def _guard_table_shell_hit(self, cmd: str) -> tuple[str | None, bool]:
+        """(guard-table path named in cmd, is_a_mutation) — see B1 above."""
+        named = next((p for p in self._guard_table_paths() if p in cmd), None)
+        if named is None:
+            return None, False
+        # An output position is unambiguous: the same patterns D6/D7 built
+        # already know where bytes land, and _is_guard_config confirms the
+        # captured token is one of the guard's two tables.
+        for pattern in SHELL_OUTPUT_PATTERNS:
+            for match in pattern.finditer(cmd):
+                if self._is_guard_config(match.group(1).strip("\"'")):
+                    return named, True
+        return named, bool(_GUARD_TABLE_MUTATE_RE.search(cmd))
+
+    def _guard_table_meta_hit(
+        self, name: str, raw_input: Any, cfg: dict[str, Any]
+    ) -> tuple[str, bool] | None:
+        """(path, is_write) when this call touches the guard's own table (D1).
+
+        Meta-integrity rather than deliverable routing: the write leg is
+        refused in every mode the middleware observes, off included, because
+        it is the one write that decides whether any other rule applies.
+        """
+        if name in _write_tools(cfg):
+            # Every string in the input is a candidate, not just the
+            # recognised path argument: gating on target_is_path let the D3
+            # list/dict shapes walk past the check entirely (B3).
+            for candidate in _strings_in(raw_input):
+                if self._is_guard_config(candidate):
+                    return candidate, True
             return None
-        for candidate in _strings_in(raw_input):
-            if self._is_guard_config(candidate):
-                return candidate
+        if name in SHELL_TOOLS:
+            path, is_write = self._guard_table_shell_hit(_shell_command(raw_input))
+            return None if path is None else (path, is_write)
         return None
 
     def _is_deliverable(self, rel: str, cfg: dict[str, Any]) -> bool:
@@ -1528,22 +1600,45 @@ class DispatchGuardMiddleware(MiddlewareBase):
         name, raw_input = _tool_call_parts(tool_call)
 
         # D1: the guard's own dispatch table is meta-integrity, not a routing
-        # rule, so it is refused in every mode the middleware observes — off
-        # included. This check has to stay above the off short-circuit: below
-        # it, a disarmed guard permitted exactly the one write that keeps it
-        # disarmed, and the "untouchable in any mode" promise was false in the
-        # one mode that mattered.
-        guard_table = self._guard_config_write(name, raw_input, cfg)
-        if guard_table is not None:
-            yield self._deny(
-                f"dispatch-guard 元完整性：{Path(_canonical_target(guard_table)).name} "
-                "是本守卫的路由配置，agent 一律不得写改（D1）；配置变更请由"
-                "操作员在会话外完成。",
-                name,
-                self._rel(_canonical_target(guard_table)),
-                mode,
-            )
-            return
+        # rule, so a write to it is refused in every mode the middleware
+        # observes — off included. This gate has to stay above the off
+        # short-circuit: below it, a disarmed guard permitted exactly the one
+        # write that keeps it disarmed, and the "untouchable in any mode"
+        # promise was false in the one mode that mattered. Both the write-tool
+        # and the shell spelling are handled here, so neither can reach the
+        # routing logic underneath.
+        meta = self._guard_table_meta_hit(name, raw_input, cfg)
+        if meta is not None:
+            path, is_write = meta
+            shown = self._rel(_canonical_target(path))
+            if is_write:
+                yield self._deny(
+                    f"dispatch-guard 元完整性：{Path(_canonical_target(path)).name} "
+                    "是本守卫的路由配置，agent 一律不得写改（D1）；配置变更请由"
+                    "操作员在会话外完成。",
+                    name,
+                    shown,
+                    mode,
+                )
+                return
+            if mode != "off":
+                # Mention tier, the one DESIGN.md defines: naming the table is
+                # worth a warning, never a refusal. Reading it is not an
+                # attack, and read_file on the same path is not guarded at
+                # all — denying only the shell spelling would be friction
+                # with no boundary behind it. off stays silent: D14's off
+                # passes calls unexamined, and a warning is examination.
+                async for event in self._warn_and_pass(
+                    f"[dispatch-guard warn] dispatch-guard 元完整性：命令中提到"
+                    f"本守卫的派发表 {shown}（D1）。读取不拦；该表只能由操作员在"
+                    "会话外维护，任何写改形式都会被拒。",
+                    name,
+                    shown,
+                    mode,
+                    next_handler,
+                ):
+                    yield event
+                return
 
         if mode == "off":
             # D14: off short-circuits here, not in the factory. Everything
@@ -1717,38 +1812,11 @@ class DispatchGuardMiddleware(MiddlewareBase):
                 return
 
         if name in SHELL_TOOLS:
-            if isinstance(raw_input, dict):
-                cmd = str(
-                    raw_input.get("command")
-                    or raw_input.get("cmd")
-                    or json.dumps(raw_input, ensure_ascii=False)
-                )
-            else:
-                cmd = str(raw_input)
-            # D1 (shell arm): a command that MENTIONS the guard's own table
-            # is treated as meta-integrity, not routing — denied under
-            # enforce, warned in every other observed mode, before the
-            # deliverable scan even runs.
-            mention = _GUARD_CONFIG_MENTION_RE.search(cmd)
-            if mention:
-                note = (
-                    f"dispatch-guard 元完整性：命令中提到本守卫的派发表 "
-                    f"{mention.group(0)}（D1）。routes.json/routes.draft.json "
-                    "只能由操作员在会话外维护；agent 经由 shell 触碰它们"
-                    "（重定向、tee、sed -i、rm 等任意形式）一律按提及级拦截。"
-                )
-                if mode == "enforce":
-                    yield self._deny(note + " 目标命令已拒绝。", name, mention.group(0), mode)
-                    return
-                async for event in self._warn_and_pass(
-                    f"[dispatch-guard warn] {note}",
-                    name,
-                    mention.group(0),
-                    mode,
-                    next_handler,
-                ):
-                    yield event
-                return
+            cmd = _shell_command(raw_input)
+            # The guard's own table is handled in on_acting, above the off
+            # short-circuit (D1/B1): meta-integrity is not a routing rule, so
+            # it cannot live in a branch that off never reaches. What is left
+            # here is deliverable routing only.
             found = self._scan_candidates(cmd, cfg)
             if found:
                 rel, explicit = found[0]

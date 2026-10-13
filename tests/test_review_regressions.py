@@ -432,7 +432,7 @@ class ReviewRegressionTest(unittest.TestCase):
         r = run(self.mw, "write_file", {"file_path": "artifacts/widget"})
         self.assertEqual(r[0].state, "denied", "the real entry still applies")
 
-    # -- D1 shell arm: shell text mentioning the guard's own table ---------
+    # -- D1 shell arm, narrowed by B1: the guard's own table, by real path --
 
     _GUARD_TABLE_CFG = {
         "mode": "enforce",
@@ -440,25 +440,94 @@ class ReviewRegressionTest(unittest.TestCase):
         "routes": [],
     }
 
-    def test_shell_mention_of_guard_table_is_denied(self):
+    def _guard_table_cfg(self, **over):
+        cfg = dict(self._GUARD_TABLE_CFG)
+        cfg.update(over)
+        self._write_config(cfg)
+        return str(dg.PLUGIN_DIR / "routes.json")
+
+    def test_shell_write_to_guard_table_by_real_path_is_denied(self):
         # review D1-shell: the write-tool branch denied explicit guard-table
         # targets, but `sed -i`/`tee`/redirects past routes.json sailed
-        # through — the one bypass that un-does every other rule. Any shell
-        # mention is intercepted, in any spelling of the two live homes.
-        self._write_config(dict(self._GUARD_TABLE_CFG))
-        plugin_table = str(dg.PLUGIN_DIR / "routes.json")
+        # through — the one bypass that un-does every other rule. What the
+        # arm keys on is the guard's own real path, not the basename: a
+        # relative spelling cannot reach a plugin directory outside the
+        # workspace, so a bare "routes.json" is somebody else's file.
+        table = self._guard_table_cfg()
         variants = [
-            f"echo '{{\"mode\":\"off\"}}' > {plugin_table}",
-            f"sed -i s/enforce/off/ {plugin_table}",
-            f"cat /etc/hosts | tee {plugin_table}",
-            "rm -f routes.json",
-            "cp backup/routes.draft.json ./routes.json",
-            f"python -c \"open(r'{plugin_table}','w').write(x)\"",
+            f"echo '{{\"mode\":\"off\"}}' > {table}",
+            f"sed -i s/enforce/off/ {table}",
+            f"cat /etc/hosts | tee {table}",
+            f"python -c \"open(r'{table}','w').write(x)\"",
+            f"rm -f {table}",
+            f"mv {table} /tmp/gone.json",
+            f"truncate -s 0 {table}",
+            f"chmod 000 {table}",
         ]
         for cmd in variants:
             with self.subTest(cmd=cmd):
                 r = run(self.mw, "execute_shell_command", {"command": cmd})
                 self.assertEqual(r[0].state, "denied")
+
+    def test_shell_write_to_guard_table_ignores_shell_enforce(self):
+        # Meta-integrity is an exact-path match, not a shell heuristic, so it
+        # neither needs nor respects the shell_enforce opt-in.
+        for shell_enforce in (False, True):
+            with self.subTest(shell_enforce=shell_enforce):
+                table = self._guard_table_cfg(shell_enforce=shell_enforce)
+                r = run(
+                    self.mw,
+                    "execute_shell_command",
+                    {"command": f"echo x > {table}"},
+                )
+                self.assertEqual(r[0].state, "denied")
+
+    def test_shell_write_to_guard_table_denied_under_mode_off(self):
+        # off disarms routing, not meta-integrity — the same ruling as the
+        # write-tool branch. A disarmed guard still refuses the one write
+        # that keeps it disarmed.
+        table = self._guard_table_cfg(mode="off")
+        r = run(
+            self.mw,
+            "execute_shell_command",
+            {"command": f"echo '{{\"mode\":\"off\"}}' > {table}"},
+        )
+        self.assertEqual(r[0].state, "denied")
+
+    def test_shell_read_of_guard_table_warns_but_never_denies(self):
+        # DESIGN.md's mention tier: naming the table earns a warning and
+        # nothing more. Reading it is not an attack, and read_file on the
+        # same path is not guarded at all — denying only the shell spelling
+        # would be friction with no boundary behind it.
+        table = self._guard_table_cfg()
+        for cmd in (f"cat {table}", f"grep -n mode {table}", f"jq .mode {table}"):
+            with self.subTest(cmd=cmd):
+                r = run(self.mw, "execute_shell_command", {"command": cmd})
+                self.assertNotEqual(r[0].state, "denied")
+                self.assertEqual(len(r[0].content), 2, "warn block must be appended")
+
+    def test_shell_commands_on_a_project_own_routes_json_are_untouched(self):
+        # B1: the arm matched the bare basename anywhere in the command text,
+        # so under enforce — with shell_enforce OFF — every project that
+        # happens to own a routes.json (Express, Angular, this repository)
+        # could not read, grep, copy or clean up its own file. All of these
+        # were denied before the fix.
+        self._guard_table_cfg()
+        variants = [
+            "cat src/routes.json",
+            "cat routes.json",
+            "grep -n docx routes.json",
+            "python -c \"print(open('routes.json').read())\"",
+            "rm -rf /tmp/x  # routes.json",
+            "cp routes.example.json routes.json",
+            "rm -f routes.json",
+            "cp backup/routes.draft.json ./routes.json",
+        ]
+        for cmd in variants:
+            with self.subTest(cmd=cmd):
+                r = run(self.mw, "execute_shell_command", {"command": cmd})
+                self.assertNotEqual(r[0].state, "denied")
+                self.assertEqual(len(r[0].content), 1, f"silent for {cmd!r}")
 
     def test_guard_table_mention_warns_not_denies_outside_enforce(self):
         cfg = dict(self._GUARD_TABLE_CFG)
