@@ -690,9 +690,14 @@ def _mtime_or_none(path: Path):
         return None
 
 
-def _discover_agents(ws: str | Path) -> list[dict[str, Any]]:
-    """Agents installed in this environment, cached per workspace until the
-    inventory inputs change (see _inventory_stamp).
+def _discover_agents(ws: str | Path) -> tuple[list[dict[str, Any]], bool]:
+    """(agents, readable) — agents installed in this environment, cached per
+    workspace until the inventory inputs change (see _inventory_stamp).
+
+    ``readable`` says whether the walk itself succeeded. An empty inventory
+    with ``readable=True`` is a genuine single-agent deployment, not a
+    layout we failed to parse — the distinction decides ``_live_owner``'s
+    no_owner-vs-trust-table verdict (D8).
 
     ``default`` (the orchestrator this middleware attaches to) and explicitly
     disabled agents are never dispatch targets and are left out.
@@ -704,7 +709,9 @@ def _discover_agents(ws: str | Path) -> list[dict[str, Any]]:
         and _AGENTS_CACHE["agents"] is not None
         and _AGENTS_CACHE.get("stamp") == stamp
     ):
-        return _AGENTS_CACHE["agents"]
+        # Only successful walks are cached, so a cache hit is readable by
+        # construction — even when the cached inventory is legitimately empty.
+        return _AGENTS_CACHE["agents"], True
     found: dict[str, dict[str, Any]] = {}
     discovery_failed = False
     try:
@@ -737,7 +744,10 @@ def _discover_agents(ws: str | Path) -> list[dict[str, Any]]:
                 "stamp": stamp,
             }
         )
-    return agents
+    # readable=False means the WALK failed (the inventory tells us nothing);
+    # readable=True with an empty list means the environment genuinely has
+    # no specialists. _live_owner treats these oppositely (D8).
+    return agents, not discovery_failed
 
 
 def _dispatch_policy(ws: str | Path, agents: list[dict[str, Any]]) -> list[tuple[str, str]]:
@@ -778,7 +788,7 @@ def _draft_route_table(ws: str | Path) -> dict[str, Any] | None:
     fall back to guessing from agent ids/skills/descriptions — a terse
     manifest scan invents ownership that the deployment never stated.
     """
-    agents = _discover_agents(ws)
+    agents, _readable = _discover_agents(ws)
     if not agents:
         return None
     cfg: dict[str, Any] = {"mode": "warn", "routes": [], "ext_routes": {}}
@@ -862,7 +872,7 @@ def _maybe_write_draft(ws: str | Path) -> Path | None:
         "dispatch-guard: drafted routes.draft.json (in %s) from %d discovered "
         "agent(s); review it and rename to routes.json to activate",
         path.parent,
-        len(_discover_agents(ws)),
+        len(_discover_agents(ws)[0]),
     )
     return path
 
@@ -1004,11 +1014,19 @@ class DispatchGuardMiddleware(MiddlewareBase):
 
     @staticmethod
     def _whitelisted(rel: str) -> bool:
-        if rel in WHITELIST_FILES:
+        # Single yardstick with _is_deliverable (D12): that side lowercases
+        # the path before judging, so whitelist comparisons must too —
+        # otherwise "notes/x" passed while "Notes/x.docx" was denied. On a
+        # case-sensitive FS the two spellings are different directories and
+        # both get the whitelist's benefit; on a case-insensitive host the
+        # same file now gets one answer. The plugin-tree containment check
+        # below stays case-sensitive: it resolves real paths, not prefixes.
+        key = rel.replace("\\", "/").lower()
+        if key in {f.lower() for f in WHITELIST_FILES}:
             return True
-        if any(rel.startswith(d) for d in WHITELIST_DIRS):
+        if any(key.startswith(d) for d in WHITELIST_DIRS):
             return True
-        if Path(rel).name in _GUARD_CONFIG_NAMES:
+        if Path(key).name in _GUARD_CONFIG_NAMES:
             # 守卫自身路由表永不白名单（D1）：default 不得改写自己的枷锁。
             return False
         # 插件本体目录 = default 的架构维护区，非交付物。
@@ -1081,15 +1099,26 @@ class DispatchGuardMiddleware(MiddlewareBase):
     def _live_owner(self, agent_id: str | None) -> tuple[str | None, bool]:
         """(owner_id, blockable): a block needs a real dispatch target.
 
-        Discovery is authoritative only when it found at least one specialist.
-        An empty discovery means "agent layout we cannot read", and the
-        operator's table is then trusted verbatim rather than used to disarm
-        the guard; a non-empty discovery vetoes routes naming absent agents
-        and unmatched deliverable classes alike — no owner, no block.
+        An empty inventory is read for what it is (D8): when the walk
+        SUCCEEDED and found nothing, this is a single-agent deployment and
+        the documented promise holds — every class is no_owner, the write
+        passes with an audit record. Only when the walk FAILED (we cannot
+        read the layout at all) do we keep the deliberate asymmetry and
+        trust the operator's table verbatim — a broken inventory must not
+        disarm the guard. In that branch no owner can be verified, so the
+        caller gets (agent_id, True) with agent_id possibly None and must
+        word its block accordingly.
         """
         if _AGENTS_CACHE["agents"] is None or _AGENTS_CACHE["ws"] != str(self._ws):
-            _discover_agents(self._ws)
+            _agents, readable = _discover_agents(self._ws)
+        else:
+            # Only successful walks are cached; a populated cache is readable.
+            readable = True
         if not _AGENTS_CACHE["agents"]:
+            if readable and _AGENTS_CACHE["agents"] is not None:
+                # Genuinely zero specialists: no owner, no block.
+                return None, False
+            # The walk failed: distrust the emptiness, trust the table.
             return agent_id, True
         if agent_id and agent_id in _AGENTS_CACHE["ids"]:
             return agent_id, True
@@ -1180,7 +1209,34 @@ class DispatchGuardMiddleware(MiddlewareBase):
             ):
                 yield event
             return
-        hint = owner or "对应专业 agent"
+        if owner is None:
+            # Trust-the-table block with no nameable owner (the agent
+            # inventory could not be read — a readable-empty one already
+            # stood down above, D8). The text must not point the agent at
+            # an invented dispatch target; the only valid next step is the
+            # user.
+            if allow_deny and mode == "enforce":
+                yield self._deny(
+                    f"该产出命中守卫规则（{why or '交付物路径'}），但当前环境的 agent "
+                    f"清单读取失败，无法确认派发目标；请勿自行产出，把该目标与"
+                    f"拦截原因回报给用户确认归属。目标：{rel}",
+                    tool_name,
+                    rel,
+                    mode,
+                )
+                return
+            async for event in self._warn_and_pass(
+                f"[dispatch-guard warn] {source} {rel} 命中 {why or '交付物路径'}，"
+                f"但 agent 清单读取失败、无法确认派发目标；enforce 模式下将被拒绝，"
+                f"请与用户确认归属。",
+                tool_name,
+                rel,
+                mode,
+                next_handler,
+            ):
+                yield event
+            return
+        hint = owner
         if allow_deny and mode == "enforce":
             yield self._deny(
                 f"该产出属于 {hint} 域（命中 {why or '交付物路径'}），"
