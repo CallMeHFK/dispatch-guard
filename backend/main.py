@@ -185,9 +185,11 @@ _CD_INTO_RE = re.compile(
 )
 
 # A bare basename only counts after such a cd, and only at a path boundary —
-# routes.json.bak is a backup and routes.json5 is another file.
+# routes.json.bak is a backup and routes.json5 is another file. "./" is how a
+# file in the current directory is spelled, so it is a boundary too (B11);
+# "../" is not: ../routes.json from a guard home is the home's parent.
 _BARE_GUARD_BASENAME_RE = re.compile(
-    r"(?:^|[\s;&|('\"`])(routes\.draft\.json|routes\.json)(?![\w.-])",
+    r"(?:^|[\s;&|('\"`])(?:\./)?(routes\.draft\.json|routes\.json)(?![\w.-])",
     re.I,
 )
 
@@ -707,7 +709,14 @@ def _shell_command(raw_input: Any) -> str:
     return str(raw_input)
 
 
-def _strings_in(value: Any, budget: int = 100_000) -> Iterator[str]:
+# Data-body argument names: their values are prose, not paths (B11). A note's
+# content that happens to hold a path string is data, not a write target.
+_DATA_KEYS = frozenset({"content", "text", "body", "data", "contents", "payload"})
+
+
+def _strings_in(
+    value: Any, budget: int = 100_000, skip_keys: frozenset[str] = frozenset()
+) -> Iterator[str]:
     """Every string reachable in a tool input, at any nesting depth.
 
     A path argument the guard cannot recognise as one is still a path: the
@@ -719,9 +728,14 @@ def _strings_in(value: Any, budget: int = 100_000) -> Iterator[str]:
     this runs inside the meta-integrity gate, above on_acting's fail-open
     wrapper, so a deeply nested body must cost bounded work and must not
     raise RecursionError out of the middleware. The budget caps nodes
-    visited, and it fails toward more scanning, not less: whatever did not
-    fit is serialized and yielded whole, so a path parked past the budget is
-    still seen as text.
+    visited, and it fails toward more scanning, not less (B11): whatever is
+    still on the stack when the budget runs out is drained shallowly —
+    strings yielded directly, containers serialized — so a path parked past
+    the limit as a list member is still seen as itself, not as text no
+    recogniser can match.
+
+    ``skip_keys`` drops a dict key's whole subtree by (lowercased) name; the
+    meta-integrity gate uses it to keep data bodies out of the path scan.
     """
     stack: list[Any] = [value]
     while stack and budget > 0:
@@ -731,13 +745,19 @@ def _strings_in(value: Any, budget: int = 100_000) -> Iterator[str]:
             yield item
         elif isinstance(item, dict):
             for key, entry in item.items():
+                if skip_keys and isinstance(key, str) and key.lower() in skip_keys:
+                    continue
                 stack.append(key)
                 stack.append(entry)
         elif isinstance(item, (list, tuple, set, frozenset)):
             stack.extend(item)
         # non-string scalars carry no path
     if stack:
-        yield repr(stack)
+        for item in stack:
+            if isinstance(item, str):
+                yield item
+            else:
+                yield repr(item)
 
 
 def _deliverable_exts(cfg: dict[str, Any]) -> frozenset[str]:
@@ -1396,7 +1416,8 @@ class DispatchGuardMiddleware(MiddlewareBase):
 
     def _cd_into_guard_home_hit(self, cmd: str) -> tuple[str | None, bool]:
         homes = self._guard_home_dirs()
-        for match in _CD_INTO_RE.finditer(cmd):
+        matches = list(_CD_INTO_RE.finditer(cmd))
+        for index, match in enumerate(matches):
             dest = match.group(1).strip("\"'")
             try:
                 p = Path(os.path.expanduser(dest))
@@ -1410,7 +1431,10 @@ class DispatchGuardMiddleware(MiddlewareBase):
                 resolved = Path(os.path.normpath(str(p)))
             if resolved not in homes:
                 continue
-            rest = cmd[match.end():]
+            # A later cd moves the shell out again: this cd only owns the
+            # segment up to the next one (later-cd-wins — B11).
+            end = matches[index + 1].start() if index + 1 < len(matches) else len(cmd)
+            rest = cmd[match.end():end]
             bare = _BARE_GUARD_BASENAME_RE.search(rest)
             if bare is None:
                 continue
@@ -1438,25 +1462,14 @@ class DispatchGuardMiddleware(MiddlewareBase):
         it is the one write that decides whether any other rule applies.
         """
         if name in _write_tools(cfg):
-            # The gate reads path arguments, not prose (B10): a content body
-            # that happens to hold the table's path string is data, and
-            # refusing it was a payload/path confusion, not a guard. Walking
-            # a recognised path key's VALUE still covers the D3 shapes — a
-            # list- or dict-valued file_path hides the path by nesting, not
-            # by renaming it. Only when no path key exists at all does the
-            # whole input get scanned (a write tool with an unusual argument
-            # name), the same fallback _target_of takes.
-            if isinstance(raw_input, dict):
-                found_path_key = False
-                for key in ("file_path", "path", "filename", "file"):
-                    if key in raw_input:
-                        found_path_key = True
-                        for candidate in _strings_in(raw_input[key]):
-                            if self._is_guard_config(candidate):
-                                return candidate, True
-                if found_path_key:
-                    return None
-            for candidate in _strings_in(raw_input):
+            # Every argument is scanned at any depth — an operator-registered
+            # write tool may carry the path under a name this guard does not
+            # know, and a clean recognised key must not end the search (B11)
+            # — except data bodies: content is data, and a content string
+            # that happens to equal the table's path is not a write target
+            # (B10). The D3 shapes are covered because a list- or dict-valued
+            # path key hides the path by nesting, not by renaming it.
+            for candidate in _strings_in(raw_input, skip_keys=_DATA_KEYS):
                 if self._is_guard_config(candidate):
                     return candidate, True
             return None

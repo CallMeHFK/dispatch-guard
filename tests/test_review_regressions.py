@@ -885,6 +885,65 @@ class ReviewRegressionTest(unittest.TestCase):
                 )
                 self.assertNotEqual(r[0].state, "denied")
 
+    # -- B11: third-pass findings ---------------------------------------------
+
+    def test_dot_slash_spelling_after_cd_is_the_table(self):
+        # `cd` changes what a relative path means, and "./x" is how people
+        # spell a file in the current directory. The basename regex required
+        # a boundary character before the name and "/" was not one, so the
+        # most natural relative spelling walked through both tiers.
+        home = str(dg.PLUGIN_DIR)
+        variants = [
+            f"cd {home} && echo '{{\"mode\":\"off\"}}' > ./routes.json",
+            f"cd {home} && sed -i s/enforce/off/ ./routes.json",
+            f"cd {home} && rm -f ./routes.json",
+        ]
+        for cmd in variants:
+            with self.subTest(cmd=cmd):
+                self._write_config(dict(self._GUARD_TABLE_CFG))
+                r = run(self.mw, "execute_shell_command", {"command": cmd})
+                self.assertEqual(r[0].state, "denied")
+
+    def test_dotdot_spelling_after_cd_is_not_the_table(self):
+        # ../routes.json from a guard home resolves to the home's parent,
+        # not to the table. Denying it would be matching text, not paths.
+        home = str(dg.PLUGIN_DIR)
+        cmd = f"cd {home} && rm -f ../routes.json"
+        self._write_config(dict(self._GUARD_TABLE_CFG))
+        r = run(self.mw, "execute_shell_command", {"command": cmd})
+        self.assertNotEqual(r[0].state, "denied")
+
+    def test_later_cd_wins(self):
+        # `cd home && cd /tmp && rm routes.json` deletes /tmp/routes.json —
+        # judging against the first cd after the shell has left it refuses
+        # a command that never touched the guard.
+        home = str(dg.PLUGIN_DIR)
+        cmd = f"cd {home} && cd /tmp && rm -f routes.json"
+        self._write_config(dict(self._GUARD_TABLE_CFG))
+        r = run(self.mw, "execute_shell_command", {"command": cmd})
+        self.assertNotEqual(r[0].state, "denied")
+
+    def test_table_path_past_the_node_budget_is_still_caught(self):
+        # The walker's budget must fail toward more scanning: a path sitting
+        # past the budget used to end up inside a repr blob that nothing
+        # downstream could recognise as a path — "seen as text" in name only.
+        target = str(dg.PLUGIN_DIR / "routes.json")
+        payload = [target] + ["x"] * 150_000
+        r = run(self.mw, "write_file", {"file_path": payload, "content": "{}"})
+        self.assertEqual(r[0].state, "denied")
+
+    def test_decoy_path_key_does_not_suppress_the_scan(self):
+        # meta.notes promises paths inside a write tool's arguments are
+        # scanned. A clean recognised path key used to end the search, so a
+        # second argument carrying the table path was never seen.
+        target = str(dg.PLUGIN_DIR / "routes.json")
+        r = run(
+            self.mw,
+            "write_file",
+            {"file_path": "notes/x.md", "destination": target},
+        )
+        self.assertEqual(r[0].state, "denied")
+
 
 if __name__ == "__main__":
     unittest.main()
