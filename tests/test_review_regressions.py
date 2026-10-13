@@ -590,6 +590,54 @@ class ReviewRegressionTest(unittest.TestCase):
             with self.subTest(target=raw):
                 self.assertFalse(dg.DispatchGuardMiddleware._whitelisted(raw))
 
+    # -- B3 (Phase 3): meta-integrity only covered a plain string path in a
+    #    mode other than off. Four shapes walked around it, and the whitelist
+    #    exclusion was unreachable for any table under a whitelisted prefix.
+
+    def test_guard_table_write_denied_under_mode_off(self):
+        # off disarms routing, not meta-integrity: the one write that must
+        # never succeed is the one that rewrites the guard's own authority.
+        self._write_config({"mode": "off", "ext_routes": {".docx": "DocAgent"}})
+        target = str(dg.PLUGIN_DIR / "routes.json")
+        r = run(self.mw, "write_file", {"file_path": target, "content": "{}"})
+        self.assertEqual(r[0].state, "denied")
+        self.assertIn("元完整性", r[0].content[0].text)
+
+    def test_guard_table_write_denied_for_non_string_path_values(self):
+        # The check was gated on target_is_path, which the D3 shapes clear.
+        target = str(dg.PLUGIN_DIR / "routes.json")
+        shapes = {
+            "list": [target],
+            "dict": {"save": target},
+            "nested": {"a": {"b": [target]}},
+        }
+        for label, value in shapes.items():
+            with self.subTest(shape=label):
+                r = run(self.mw, "write_file", {"file_path": value, "content": "{}"})
+                self.assertEqual(r[0].state, "denied")
+
+    def test_guard_table_write_denied_case_insensitively(self):
+        # A case-insensitive host resolves ROUTES.JSON to the same file as
+        # routes.json, so the yardstick must be case-insensitive too — the
+        # same call D12 made for the whitelist.
+        target = str(dg.PLUGIN_DIR / "ROUTES.JSON")
+        r = run(self.mw, "write_file", {"file_path": target, "content": "{}"})
+        self.assertEqual(r[0].state, "denied")
+
+    def test_guard_table_write_denied_with_trailing_dot(self):
+        for spelling in ("routes.json.", "routes.json ", "routes.json ."):
+            with self.subTest(spelling=spelling):
+                target = str(dg.PLUGIN_DIR / spelling)
+                r = run(self.mw, "write_file", {"file_path": target, "content": "{}"})
+                self.assertEqual(r[0].state, "denied")
+
+    def test_guard_table_basenames_are_never_whitelisted(self):
+        # The exclusion sat below two early returns, so a table parked under
+        # a whitelisted prefix returned True and never reached it.
+        for rel in ("tmp/routes.json", "notes/routes.draft.json", "routes.json"):
+            with self.subTest(rel=rel):
+                self.assertFalse(dg.DispatchGuardMiddleware._whitelisted(rel))
+
 
 if __name__ == "__main__":
     unittest.main()

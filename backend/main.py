@@ -45,7 +45,7 @@ import os
 import re
 import shutil
 import time
-from collections.abc import AsyncGenerator, Callable
+from collections.abc import AsyncGenerator, Callable, Iterator
 from pathlib import Path
 from typing import Any
 
@@ -634,6 +634,32 @@ def _redacted_audit_target(raw: str) -> str:
     return f"sha256:{digest} len:{len(text)} excerpt:{excerpt!r}"
 
 
+def _strings_in(value: Any, depth: int = 0) -> Iterator[str]:
+    """Every string reachable in a tool input, at any nesting depth.
+
+    A path argument the guard cannot recognise as one is still a path: the
+    D3 shapes (``file_path`` as a list or a dict) used to clear the checks
+    gated on ``target_is_path`` and walk straight past them. Walking the
+    whole input means nesting buys nothing.
+
+    Depth-capped because the input is untrusted and this runs before the
+    fail-open wrapper in ``on_acting``: a deeply nested body must cost a
+    bounded amount of work and must not raise RecursionError out of the
+    middleware. Past the cap the remainder is simply not inspected.
+    """
+    if isinstance(value, str):
+        yield value
+    elif depth >= 12:
+        return
+    elif isinstance(value, dict):
+        for key, item in value.items():
+            yield from _strings_in(key, depth + 1)
+            yield from _strings_in(item, depth + 1)
+    elif isinstance(value, (list, tuple, set, frozenset)):
+        for item in value:
+            yield from _strings_in(item, depth + 1)
+
+
 def _deliverable_exts(cfg: dict[str, Any]) -> frozenset[str]:
     """Deliverable extensions: the defaults plus whatever routes.json adds."""
     exts = set(DEFAULT_DELIVERABLE_EXTS)
@@ -1137,13 +1163,16 @@ class DispatchGuardMiddleware(MiddlewareBase):
         # must not make the two halves of one decision disagree about which
         # string they are looking at.
         key = _canonical_target(rel).replace("\\", "/").lower()
+        if Path(key).name in _GUARD_CONFIG_NAMES:
+            # 守卫自身路由表永不白名单（D1）：default 不得改写自己的枷锁。
+            # Tested first, not last: below the two early returns it was
+            # unreachable for any table parked under a whitelisted prefix,
+            # so "tmp/routes.json" was whitelisted on the prefix match.
+            return False
         if key in {f.lower() for f in WHITELIST_FILES}:
             return True
         if any(key.startswith(d) for d in WHITELIST_DIRS):
             return True
-        if Path(key).name in _GUARD_CONFIG_NAMES:
-            # 守卫自身路由表永不白名单（D1）：default 不得改写自己的枷锁。
-            return False
         # 插件本体目录 = default 的架构维护区，非交付物。
         # 只对原本就是绝对路径的目标生效：rel 相对路径是工作区相对的，
         # 按 cwd resolve 会误判（仓库恰好在 PLUGIN_DIR.parent 下时全白名单）。
@@ -1163,10 +1192,20 @@ class DispatchGuardMiddleware(MiddlewareBase):
         and the plugin-data directory (the reinstall-proof copy). Symlinks
         are resolved so a crafted path cannot dress the table as something
         else (D1).
+
+        The basename test is canonicalised and case-insensitive (B3). A
+        trailing dot or space is the same spelling accident D9 handles, and
+        on a case-insensitive host ``ROUTES.JSON`` is the guard's table, not
+        a neighbour of it. The cost of that choice falls on a case-sensitive
+        filesystem, where a file genuinely named ``ROUTES.JSON`` inside the
+        guard's own two directories would be refused — a file nobody has a
+        reason to write there, against a bypass that works on every macOS
+        and Windows host.
         """
-        if Path(target).name not in _GUARD_CONFIG_NAMES:
+        text = _canonical_target(str(target))
+        if Path(text).name.lower() not in _GUARD_CONFIG_NAMES:
             return False
-        p = Path(self._rel(target))
+        p = Path(self._rel(text))
         if not p.is_absolute():
             p = self._ws / p
         try:
@@ -1180,6 +1219,21 @@ class DispatchGuardMiddleware(MiddlewareBase):
             except (ValueError, OSError):
                 continue
         return False
+
+    def _guard_config_write(self, name: str, raw_input: Any, cfg: dict[str, Any]) -> str | None:
+        """The guard table this call would write, or None (D1).
+
+        Walks every string in the input rather than only the recognised path
+        argument: gating on ``target_is_path`` meant a list- or dict-valued
+        ``file_path`` — the D3 shape — skipped the meta-integrity check
+        entirely and the write went through.
+        """
+        if name not in _write_tools(cfg):
+            return None
+        for candidate in _strings_in(raw_input):
+            if self._is_guard_config(candidate):
+                return candidate
+        return None
 
     def _is_deliverable(self, rel: str, cfg: dict[str, Any]) -> bool:
         """Deliverable-shaped: inside a deliverable directory or extension.
@@ -1439,6 +1493,27 @@ class DispatchGuardMiddleware(MiddlewareBase):
     ) -> AsyncGenerator[Any, None]:
         cfg = _load_config()
         mode = cfg.get("mode", "enforce")
+        tool_call = input_kwargs.get("tool_call")
+        name, raw_input = _tool_call_parts(tool_call)
+
+        # D1: the guard's own dispatch table is meta-integrity, not a routing
+        # rule, so it is refused in every mode the middleware observes — off
+        # included. This check has to stay above the off short-circuit: below
+        # it, a disarmed guard permitted exactly the one write that keeps it
+        # disarmed, and the "untouchable in any mode" promise was false in the
+        # one mode that mattered.
+        guard_table = self._guard_config_write(name, raw_input, cfg)
+        if guard_table is not None:
+            yield self._deny(
+                f"dispatch-guard 元完整性：{Path(_canonical_target(guard_table)).name} "
+                "是本守卫的路由配置，agent 一律不得写改（D1）；配置变更请由"
+                "操作员在会话外完成。",
+                name,
+                self._rel(_canonical_target(guard_table)),
+                mode,
+            )
+            return
+
         if mode == "off":
             # D14: off short-circuits here, not in the factory. Everything
             # passes, but the first off-observed call after entering (or
@@ -1468,8 +1543,6 @@ class DispatchGuardMiddleware(MiddlewareBase):
             return
         _OFF_LOGGED = False
 
-        tool_call = input_kwargs.get("tool_call")
-        name, raw_input = _tool_call_parts(tool_call)
         if not name:
             # D2: an unrecognizable tool_call shape must not silently disarm
             # the guard. Audit it; when anything about it smells like a spawn
@@ -1559,16 +1632,6 @@ class DispatchGuardMiddleware(MiddlewareBase):
             return
 
         if name in _write_tools(cfg):
-            if target_is_path and self._is_guard_config(target):
-                yield self._deny(
-                    f"dispatch-guard 元完整性：{Path(str(target)).name} 是本守卫的"
-                    "路由配置，agent 一律不得写改（D1）；配置变更请由操作员在"
-                    "会话外完成。",
-                    name,
-                    self._rel(target),
-                    mode,
-                )
-                return
             # Whitelisted bookkeeping writes and every non-deliverable write
             # (notes, scripts, configs, scratch, extension-less files) are
             # basic operations: they pass untouched in every mode, without a
