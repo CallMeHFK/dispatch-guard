@@ -330,6 +330,56 @@ class ReviewRegressionTest(unittest.TestCase):
                 self.assertNotEqual(r[0].state, "denied")
                 self.assertEqual(len(r[0].content), 1, f"no warn block for {cmd!r}")
 
+    # -- D9: trailing-dot / trailing-space ext perturbation ------------------
+
+    def test_perturbed_ext_still_routes(self):
+        # review D9: "report.docx." / "report.docx " made splitext see "." or
+        # ".docx " — the target stopped being a deliverable at all, and on a
+        # pure ext_routes table the write escaped even without the dot game.
+        self._write_config(
+            {"mode": "enforce", "ext_routes": {".docx": "DocAgent"}, "routes": []}
+        )
+        for p in ("outputs/a.docx.", "outputs/a.docx ", "report.docx."):
+            with self.subTest(path=p):
+                r = run(self.mw, "write_file", {"file_path": p})
+                self.assertEqual(r[0].state, "denied")
+
+    # -- D11: a legit path key must not close the input-body scan ------------
+
+    def test_nested_param_deliverable_gets_mention_warning(self):
+        # review D11: file_path "notes/ok.md" short-circuited the whole
+        # scan — a deliverable hidden in another argument was invisible.
+        self._write_config(
+            {"mode": "enforce", "ext_routes": {".docx": "DocAgent"}, "routes": []}
+        )
+        r = run(
+            self.mw,
+            "write_file",
+            {"file_path": "notes/ok.md", "extra": {"save_as": "outputs/a.docx"}},
+        )
+        self.assertNotEqual(r[0].state, "denied", "mention tier never blocks")
+        self.assertEqual(len(r[0].content), 2, "mention must warn")
+
+    # -- D16: non-string deliverable_dirs members -----------------------------
+
+    def test_nonstring_deliverable_dirs_members_dropped(self):
+        # review D16: str() turned None/5 into "none/"/"5/" directories —
+        # the config was silently mutated instead of degraded field-wise.
+        self._write_config(
+            {
+                "mode": "enforce",
+                "deliverable_dirs": [None, 5, "artifacts"],
+                "ext_routes": {},
+                "routes": [{"match": ["widget"], "agent": "DocAgent"}],
+            }
+        )
+        r = run(self.mw, "write_file", {"file_path": "none/widget"})
+        self.assertEqual(len(r[0].content), 1, "None must not invent a dir")
+        r = run(self.mw, "write_file", {"file_path": "5/widget"})
+        self.assertEqual(len(r[0].content), 1, "5 must not invent a dir")
+        r = run(self.mw, "write_file", {"file_path": "artifacts/widget"})
+        self.assertEqual(r[0].state, "denied", "the real entry still applies")
+
 
 if __name__ == "__main__":
     unittest.main()

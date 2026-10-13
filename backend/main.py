@@ -517,10 +517,33 @@ def _deliverable_dirs(cfg: dict[str, Any]) -> tuple[str, ...]:
     dirs = list(DEFAULT_DELIVERABLE_DIRS)
     custom = cfg.get("deliverable_dirs")
     if isinstance(custom, list):
-        dirs += tuple(
-            str(d).strip().lower().rstrip("/") + "/" for d in custom if str(d).strip()
-        )
+        for d in custom:
+            if not isinstance(d, str):
+                # D16: a non-string member is a config mistake, not a
+                # directory. str()-coercing it invented "none/" / "5/"
+                # entries the operator never wrote — drop it with a warning
+                # instead, per the "wrong type degrades to absent field"
+                # promise.
+                logger.warning(
+                    "dispatch-guard: ignoring non-string deliverable_dirs entry %r", d
+                )
+                continue
+            s = d.strip().lower().rstrip("/")
+            if s:
+                dirs.append(s + "/")
     return tuple(dirs)
+
+
+def _canonical_target(p: str) -> str:
+    """The target string judged by the guard (D9).
+
+    Trailing whitespace and trailing dots are spelling accidents, not
+    different files: ``report.docx.`` is the same write as ``report.docx``
+    on every filesystem that matters here, and an ext-only routes table
+    must not stand down because of one stray dot. Display and audit keep
+    the original string; only the judgment form is canonicalized.
+    """
+    return p.strip().rstrip(".")
 
 
 def _deliverable_exts(cfg: dict[str, Any]) -> frozenset[str]:
@@ -1080,7 +1103,7 @@ class DispatchGuardMiddleware(MiddlewareBase):
         (``/somewhere/outputs/report``) must match on the segment or the
         guard simply never sees it.
         """
-        p = rel.replace("\\", "/").lower()
+        p = _canonical_target(rel).replace("\\", "/").lower()
         dirs = _deliverable_dirs(cfg)
         if p.startswith(dirs):
             return True
@@ -1260,6 +1283,7 @@ class DispatchGuardMiddleware(MiddlewareBase):
 
     def _route_hit(self, blob: str) -> tuple[str | None, str | None]:
         cfg = _load_config()
+        blob = _canonical_target(blob)  # D9: "a.docx." routes as "a.docx"
         ext = os.path.splitext(blob)[1].lower()
         agent = cfg.get("ext_routes", {}).get(ext)
         if agent:
@@ -1434,6 +1458,17 @@ class DispatchGuardMiddleware(MiddlewareBase):
                 candidate = self._rel(target)
                 if not self._whitelisted(candidate) and self._is_deliverable(candidate, cfg):
                     rel, explicit = candidate, True
+                elif isinstance(raw_input, dict):
+                    # D11: a legitimate non-deliverable path key must not
+                    # close the scanner over the rest of the input — a
+                    # deliverable path hidden in another argument is still
+                    # worth a mention-level warning.
+                    found = self._scan_candidates(
+                        json.dumps(raw_input, ensure_ascii=False), cfg
+                    )
+                    if found:
+                        rel, explicit = found[0][0], False
+                        source = "其它参数中出现交付物路径"
             else:
                 found = self._scan_candidates(target, cfg)
                 if found:
