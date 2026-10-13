@@ -833,6 +833,31 @@ def _maybe_write_draft(ws: str | Path) -> Path | None:
     return path
 
 
+def _tool_call_parts(tool_call: Any) -> tuple[str, Any]:
+    """(name, input) from either an object or a Mapping-shaped tool_call.
+
+    QwenPaw passes an object with .name/.input, but a dict-shaped call must
+    not fall through getattr()'s defaults and silently disarm every rule
+    (D2 — a dict tool_call used to read as name="" and slip the spawn
+    backstop).
+    """
+    if isinstance(tool_call, dict):
+        name = tool_call.get("name") or ""
+        return str(name), tool_call.get("input", "") or ""
+    name = getattr(tool_call, "name", "") or ""
+    return str(name), getattr(tool_call, "input", "") or ""
+
+
+def _has_typed_path_value(raw_input: Any) -> bool:
+    """True when a path-argument key holds a non-string value (D3)."""
+    if not isinstance(raw_input, dict):
+        return False
+    return any(
+        key in raw_input and not isinstance(raw_input[key], str)
+        for key in ("file_path", "path", "filename", "file")
+    )
+
+
 class DispatchGuardMiddleware(MiddlewareBase):
     def __init__(self, workspace_dir: str, mode: str) -> None:
         self._ws = Path(workspace_dir).resolve()
@@ -877,7 +902,16 @@ class DispatchGuardMiddleware(MiddlewareBase):
         if isinstance(tool_input, dict):
             for key in ("file_path", "path", "filename", "file"):
                 if key in tool_input:
-                    return str(tool_input[key]), True
+                    value = tool_input[key]
+                    if isinstance(value, str):
+                        return value, True
+                    # D3: never str() a non-string path value into a fake
+                    # path ("['outputs/a.docx']" is not a path — treating it
+                    # as one silently disarmed every rule). Hand the whole
+                    # input to _scan_candidates as a blob instead; the write
+                    # branch escalates deliverable shapes inside it to
+                    # explicit targets.
+                    return json.dumps(tool_input, ensure_ascii=False), False
             return json.dumps(tool_input, ensure_ascii=False), False
         return str(tool_input), False
 
@@ -1205,8 +1239,34 @@ class DispatchGuardMiddleware(MiddlewareBase):
             return
 
         tool_call = input_kwargs.get("tool_call")
-        name = getattr(tool_call, "name", "") or ""
-        raw_input = getattr(tool_call, "input", "") or ""
+        name, raw_input = _tool_call_parts(tool_call)
+        if not name:
+            # D2: an unrecognizable tool_call shape must not silently disarm
+            # the guard. Audit it; when anything about it smells like a spawn
+            # call, refuse outright — the most conservative reading.
+            blob = str(tool_call)[:300]
+            if "spawn" in blob.lower():
+                yield self._deny(
+                    "dispatch-guard: 无法识别的 tool_call 形状且疑似 spawn "
+                    "调用，按最保守策略拒绝（D2）。",
+                    "unknown",
+                    blob,
+                    mode,
+                )
+                return
+            self._log(
+                {
+                    "action": "warned",
+                    "tool": "unknown",
+                    "target": blob,
+                    "mode": mode,
+                    "message": "dispatch-guard: 无法识别的 tool_call 形状；"
+                    "已放行并记录（D2）",
+                }
+            )
+            async for event in next_handler():
+                yield event
+            return
         forwarded = False
         try:
             async for event in self._dispatch(name, raw_input, mode, cfg, next_handler):
@@ -1288,7 +1348,16 @@ class DispatchGuardMiddleware(MiddlewareBase):
                 found = self._scan_candidates(target, cfg)
                 if found:
                     rel, explicit = found[0]
-                    source = "参数/代码中出现交付物路径" if not explicit else "生成交付物"
+                    if _has_typed_path_value(raw_input):
+                        # D3: a deliverable shape inside a non-string path
+                        # argument is an explicit write target, not a casual
+                        # mention.
+                        explicit = True
+                        source = "类型异常的路径参数中含交付物"
+                    else:
+                        source = (
+                            "参数/代码中出现交付物路径" if not explicit else "生成交付物"
+                        )
             if rel is not None:
                 async for event in self._guard_target(
                     rel,

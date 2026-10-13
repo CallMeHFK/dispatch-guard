@@ -215,6 +215,51 @@ class ReviewRegressionTest(unittest.TestCase):
         ]
         self.assertIn("warned", actions)
 
+    # -- D2: a Mapping-shaped tool_call must not silently disarm the guard --
+
+    def test_dict_tool_call_does_not_disarm_spawn_backstop(self):
+        # review D2: getattr(tool_call, "name", "") read "" from a dict, so a
+        # Mapping-shaped spawn call slipped the backstop entirely.
+        call = {"name": "spawn_subagent", "input": {"task": "x"}}
+        r = run(self.mw, "spawn_subagent", None, call=call)
+        self.assertEqual(r[0].state, "denied")
+
+    def test_unknown_tool_call_shape_is_audited_not_silent(self):
+        # Unrecognizable shape: audited + fail-open pass, never silent.
+        r = run(self.mw, "write_file", None, call=object())
+        self.assertNotEqual(r[0].state, "denied")
+        audit = Path(self.ws) / "logs" / "dispatch_guard.jsonl"
+        records = [
+            json.loads(line)
+            for line in audit.read_text(encoding="utf-8").splitlines()
+        ]
+        self.assertTrue(
+            any(
+                rec["action"] == "warned" and rec["tool"] == "unknown"
+                for rec in records
+            )
+        )
+        # ...but when anything about it smells like spawn, refuse.
+        r2 = run(self.mw, "x", None, call={"payload": "spawn_subagent --foo"})
+        self.assertEqual(r2[0].state, "denied")
+
+    # -- D3: non-string path values must not be str()'d into fake paths -----
+
+    def test_list_valued_file_path_is_denied(self):
+        # review D3: ["outputs/a.docx"] used to become the literal path
+        # "['outputs/a.docx']" and pass untouched.
+        r = run(self.mw, "write_file", {"file_path": ["outputs/a.docx"]})
+        self.assertEqual(r[0].state, "denied")
+
+    def test_dict_valued_file_path_is_denied(self):
+        r = run(self.mw, "write_file", {"file_path": {"save": "outputs/a.docx"}})
+        self.assertEqual(r[0].state, "denied")
+
+    def test_non_deliverable_typed_value_still_passes(self):
+        # The conservative escalation must not swallow basic operations.
+        r = run(self.mw, "write_file", {"file_path": ["notes/ok.md"]})
+        self.assertNotEqual(r[0].state, "denied")
+
 
 if __name__ == "__main__":
     unittest.main()
