@@ -147,16 +147,43 @@ WHITELIST_FILES = {
 # observes (D1 — meta-integrity, not deliverable routing).
 _GUARD_CONFIG_NAMES = frozenset({"routes.json", "routes.draft.json"})
 
-# Command-line shapes that name an output FILE (redirect, tee, a converter's
-# -o, or the destination of cp/mv/rsync/install). Whether that file is a
+# Command-line shapes that name an output FILE (redirect, tee, an output
+# flag, or the destination of cp/mv/rsync/install). Whether that file is a
 # deliverable is decided by _is_deliverable(), not here — so a redirect into
 # a notes file never trips the heuristic. The cp-family pattern is greedy so
 # the captured token is the segment's last argument = the destination.
 SHELL_OUTPUT_PATTERNS = (
-    re.compile(r"(?:>>|\btee\b(?:\s+-\w+)*\s+|>)\s*([^\s;&|]+)", re.I),
+    # Redirects and tee. ``>|`` (the noclobber override) needs its own
+    # alternative — the capture class excludes ``|``, so the bare ``>``
+    # branch never sees it (D6). tee accepts long options (``--append``),
+    # which ``-\w+`` cannot spell (D6).
+    re.compile(r"(?:>\||>>|\btee\b(?:\s+-{1,2}[\w-]+)*\s+|>)\s*([^\s;&|]+)", re.I),
+    # An explicit output flag on ANY producer (D7): -o FILE / -O FILE,
+    # --outdir / --output(-dir) / --output-document, value joined by = or
+    # whitespace. Anchored to the flag shape instead of a fixed tool list —
+    # the false-positive cost is absorbed downstream by _is_deliverable
+    # (the captured token still has to look like a deliverable) and by the
+    # warn tier.
     re.compile(
-        r"\b(?:pandoc|ffmpeg|soffice|libreoffice)\b[^;&|]*?"
-        r"(?:--outdir(?:=|\s+)|--output(?:-dir)?(?:=|\s+)|-o\s+)([^\s;&|]+)",
+        r"(?:^|[\s;&|])(?:--outdir|--output(?:-dir)?|--output-document"
+        r"|-[oO])(?:=|\s+)([^\s;&|]+)",
+        re.I,
+    ),
+    # Compilers also accept the joined form: gcc -ooutputs/prog.exe (D7).
+    re.compile(
+        r"\b(?:gcc|g\+\+|clang|clang\+\+|cc|c\+\+)\b[^;&|]*?[\s;]"
+        r"-o(?=[^\s;&|])([^\s;&|]+)",
+        re.I,
+    ),
+    # dd's output operand (D7).
+    re.compile(r"\bdd\b(?:\s+[^;&|\s]+)*?\s+of=([^\s;&|]+)", re.I),
+    # Archivers (D7): zip's first positional argument is the archive being
+    # created; tar's is the token after a flag bundle containing c(reate)
+    # and f(ile) — an extraction (xf) names an input, not an output.
+    re.compile(r"\bzip\b(?:\s+-{1,2}[\w-]+)*\s+([^\s;&|]+)", re.I),
+    re.compile(
+        r"\btar\b(?:\s+[^;&|\s]+)*?\s+(?:-{1,2})?[a-zA-Z]*c[a-zA-Z]*f[a-zA-Z]*"
+        r"(?:\s+|=)([^\s;&|]+)",
         re.I,
     ),
     re.compile(r"\b(?:cp|mv|rsync|install)\b[^;&|]*\s+([^\s;&|]+)", re.I),
@@ -167,6 +194,13 @@ SHELL_OUTPUT_PATTERNS = (
     re.compile(
         r"\bffmpeg\b(?=[^;&|]*\s-i\s)[^;&|]*?\s(?<!-i\s)"
         r"([^\s;&|]*\.[A-Za-z0-9]{1,12})(?=\s*(?:[;&|]|$))",
+        re.I,
+    ),
+    # In-place editors (D7): sed -i / perl -i rewrite their trailing file
+    # argument — the same edit through edit_file would be denied.
+    re.compile(
+        r"\b(?:sed|perl)\b(?=[^;&|]*(?:\s--in-place|\s-[\w-]*i\b))"
+        r"[^;&|]*?\s([^\s;&|]*\.[A-Za-z0-9]{1,12})(?=\s*(?:[;&|]|$))",
         re.I,
     ),
 )

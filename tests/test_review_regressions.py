@@ -260,6 +260,76 @@ class ReviewRegressionTest(unittest.TestCase):
         r = run(self.mw, "write_file", {"file_path": ["notes/ok.md"]})
         self.assertNotEqual(r[0].state, "denied")
 
+    # -- D6/D7: shell write-target coverage (every variant, parametrized) ---
+
+    _SHELL_ENFORCE_CFG = {
+        "mode": "enforce",
+        "shell_enforce": True,
+        "ext_routes": {".docx": "DocAgent"},
+        "routes": [{"match": ["outputs"], "agent": "DocAgent"}],
+    }
+
+    def test_shell_redirect_variants_are_seen(self):
+        # review D6: >| (noclobber) and tee's long options were invisible —
+        # the capture class excludes "|", and -\w+ cannot spell "--append".
+        variants = [
+            "echo x > outputs/r.docx",
+            "echo x >> outputs/r.docx",
+            "echo x >| outputs/r.docx",
+            "echo x | tee outputs/r.docx",
+            "echo x | tee -a outputs/r.docx",
+            "echo x | tee --append outputs/r.docx",
+        ]
+        for cmd in variants:
+            with self.subTest(cmd=cmd):
+                self._write_config(dict(self._SHELL_ENFORCE_CFG))
+                r = run(self.mw, "execute_shell_command", {"command": cmd})
+                self.assertEqual(r[0].state, "denied")
+
+    def test_shell_producer_families_are_seen(self):
+        # review D7: downloader/archiver/compiler/in-place-editor outputs
+        # were a whole class of invisible deliverable producers.
+        variants = [
+            "curl -o outputs/a.docx https://x/y",
+            "curl -O https://x/y/a.docx",
+            "wget -O outputs/a.docx https://x/y",
+            "wget --output-document=outputs/a.docx https://x/y",
+            "dd if=/tmp/z of=outputs/d.docx",
+            "zip -r outputs/b.zip src/",
+            "tar czf outputs/b.tgz src/",
+            "gcc -o outputs/prog.exe main.c",
+            "gcc -ooutputs/prog.exe main.c",
+            "python gen.py --outdir outputs",
+            "pandoc a.md -o outputs/r.docx",
+            "soffice --headless --convert-to docx --outdir outputs x.odt",
+            "sed -i s/x/y/ outputs/s.docx",
+            "sed --in-place s/x/y/ outputs/s.docx",
+            "perl -pi -e s/x/y/ outputs/p.docx",
+        ]
+        for cmd in variants:
+            with self.subTest(cmd=cmd):
+                self._write_config(dict(self._SHELL_ENFORCE_CFG))
+                r = run(self.mw, "execute_shell_command", {"command": cmd})
+                self.assertEqual(r[0].state, "denied")
+
+    def test_shell_producer_family_negative_controls(self):
+        # Reads and non-output shapes of the same tools must stay silent:
+        # coverage is about writes, not about punishing inspection.
+        variants = [
+            "grep -o pat notes/x.md",
+            "tar xf inputs/b.tgz",
+            "unzip inputs/b.zip -d /tmp/x",
+            "sed -n s/x/y/p notes/x.md",
+            "ffmpeg -i clip.mov",
+            "curl -s https://x/y",
+        ]
+        for cmd in variants:
+            with self.subTest(cmd=cmd):
+                self._write_config(dict(self._SHELL_ENFORCE_CFG))
+                r = run(self.mw, "execute_shell_command", {"command": cmd})
+                self.assertNotEqual(r[0].state, "denied")
+                self.assertEqual(len(r[0].content), 1, f"no warn block for {cmd!r}")
+
 
 if __name__ == "__main__":
     unittest.main()
