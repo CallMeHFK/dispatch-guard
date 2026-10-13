@@ -12,6 +12,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "backend"))
@@ -138,6 +139,81 @@ class ReviewRegressionTest(unittest.TestCase):
         self.assertEqual(
             (data_dir / "routes.json").read_text(encoding="utf-8"), good
         )
+
+    # -- D4: malformed routes.json fields degrade, never crash --------------
+
+    def test_null_match_rule_degrades_gracefully(self):
+        # review D4: {"match": null} raised TypeError out of _route_hit on
+        # every deliverable interception. After the fix the rule degrades to
+        # empty keywords — the class it meant to claim is unrouted, so the
+        # write passes as no_owner (a malformed table must not become a
+        # blanket blocker).
+        self._write_config(
+            {
+                "mode": "enforce",
+                "routes": [{"match": None, "agent": "DocAgent"}],
+                "ext_routes": {},
+            }
+        )
+        with self.assertLogs("dispatch_guard.qwenpaw", level="WARNING") as logs:
+            r = run(self.mw, "write_file", {"file_path": "outputs/a.docx"})
+        self.assertNotEqual(r[0].state, "denied")
+        self.assertTrue(any("null 'match'" in line for line in logs.output))
+        audit = Path(self.ws) / "logs" / "dispatch_guard.jsonl"
+        actions = [
+            json.loads(line)["action"]
+            for line in audit.read_text(encoding="utf-8").splitlines()
+        ]
+        self.assertIn("no_owner", actions)
+        # ...and healthy rules in the same table (plus coerced non-string
+        # keywords) keep routing.
+        self._write_config(
+            {
+                "mode": "enforce",
+                "routes": [
+                    {"match": None, "agent": "DocAgent"},
+                    {"match": [123, "报告"], "agent": "DocAgent"},
+                ],
+                "ext_routes": {},
+            }
+        )
+        r2 = run(self.mw, "write_file", {"file_path": "outputs/报告.docx"})
+        self.assertEqual(r2[0].state, "denied")
+
+    # -- D5: a malformed agent manifest must not crash discovery ------------
+
+    def test_noniterable_manifest_skills_degrades_not_crashes(self):
+        # review D5: {"skills": 5} raised TypeError out of
+        # _parse_agent_manifest and crashed every deliverable-shaped call.
+        bad = Path(self.ws) / "agents" / "Bad"
+        bad.mkdir(parents=True)
+        (bad / "agent.json").write_text(
+            '{"id":"Bad","skills":5}', encoding="utf-8"
+        )
+        self._bust()
+        with self.assertLogs("dispatch_guard.qwenpaw", level="WARNING") as logs:
+            r = run(self.mw, "write_file", {"file_path": "outputs/a.docx"})
+        self.assertEqual(r[0].state, "denied")  # DocAgent still owns .docx
+        self.assertTrue(any("non-list skills" in line for line in logs.output))
+
+    # -- F17: guard-internal errors fail open, never wedge the agent --------
+
+    def test_internal_error_fails_open_with_warning(self):
+        with mock.patch.object(
+            self.mw, "_route_hit", side_effect=RuntimeError("boom")
+        ):
+            with self.assertLogs("dispatch_guard.qwenpaw", level="ERROR") as logs:
+                r = run(self.mw, "write_file", {"file_path": "outputs/a.docx"})
+        self.assertNotEqual(r[0].state, "denied")
+        texts = [getattr(b, "text", "") for b in r[0].content]
+        self.assertTrue(any("内部异常" in text for text in texts))
+        self.assertTrue(any("failing open" in line for line in logs.output))
+        audit = Path(self.ws) / "logs" / "dispatch_guard.jsonl"
+        actions = [
+            json.loads(line)["action"]
+            for line in audit.read_text(encoding="utf-8").splitlines()
+        ]
+        self.assertIn("warned", actions)
 
 
 if __name__ == "__main__":

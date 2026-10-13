@@ -243,13 +243,37 @@ def _normalize_config(data: Any) -> dict[str, Any]:
             )
             continue
         match = rule.get("match")
-        if match is not None and not isinstance(match, list):
+        if match is None:
+            # An explicit JSON null is a typo, not an empty list: degrade to
+            # no keywords instead of letting _route_hit crash on it (D4).
+            logger.warning(
+                "dispatch-guard: route for %r has a null 'match'; treated as "
+                "empty",
+                rule.get("agent"),
+            )
+            rule = {**rule, "match": []}
+        elif not isinstance(match, list):
             logger.warning(
                 "dispatch-guard: route for %r has a non-array 'match'; its "
                 "keywords are dropped",
                 rule.get("agent"),
             )
             rule = {**rule, "match": []}
+        else:
+            kws: list[str] = []
+            for kw in match:
+                if kw is None:
+                    continue
+                text = kw if isinstance(kw, str) else str(kw)
+                if text:
+                    kws.append(text)
+            if len(kws) != len(match):
+                logger.warning(
+                    "dispatch-guard: route for %r had non-string 'match' "
+                    "keywords; coerced to strings, unusable ones dropped",
+                    rule.get("agent"),
+                )
+            rule = {**rule, "match": kws}
         cleaned.append(rule)
     cfg["routes"] = cleaned
     return cfg
@@ -536,6 +560,15 @@ def _parse_agent_manifest(path: Path) -> dict[str, Any] | None:
     skills = data.get("skills") or data.get("capabilities") or []
     if isinstance(skills, str):
         skills = [s.strip() for s in re.split(r"[,;/]", skills) if s.strip()]
+    elif not isinstance(skills, list):
+        # A malformed manifest must not crash discovery for every later
+        # interception (D5): degrade this agent's skills to empty and say so.
+        logger.warning(
+            "dispatch-guard: %s has non-list skills (%s); treated as empty",
+            path.name,
+            type(skills).__name__,
+        )
+        skills = []
     return {
         "id": str(agent_id),
         "skills": [str(s) for s in skills],
@@ -1174,6 +1207,45 @@ class DispatchGuardMiddleware(MiddlewareBase):
         tool_call = input_kwargs.get("tool_call")
         name = getattr(tool_call, "name", "") or ""
         raw_input = getattr(tool_call, "input", "") or ""
+        forwarded = False
+        try:
+            async for event in self._dispatch(name, raw_input, mode, cfg, next_handler):
+                forwarded = True
+                yield event
+        except Exception:
+            if forwarded:
+                # The tool already started answering: failing open now would
+                # run next_handler a second time. A tool-originated error is
+                # not the guard's to swallow — let it propagate.
+                raise
+            # F17: a guard-internal failure must never wedge the agent — host
+            # log the traceback, audit it, and fail open with a warning block
+            # (the project's fail-open rule), instead of letting the exception
+            # bubble out of the middleware.
+            logger.exception(
+                "dispatch-guard: unexpected error while guarding %s; "
+                "failing open with a warning",
+                name or "<unknown>",
+            )
+            async for event in self._warn_and_pass(
+                "[dispatch-guard warn] 守卫内部异常，本次按 warn 语义放行；"
+                "详情见 host log。",
+                name or "unknown",
+                "",
+                mode,
+                next_handler,
+            ):
+                yield event
+
+    async def _dispatch(
+        self,
+        name: str,
+        raw_input: Any,
+        mode: str,
+        cfg: dict[str, Any],
+        next_handler: Callable[..., AsyncGenerator[Any, None]],
+    ) -> AsyncGenerator[Any, None]:
+        """The decision path, split from on_acting so F17 can fail it open."""
         target, target_is_path = self._target_of(raw_input)
 
         if name in SPAWN_TOOLS:
