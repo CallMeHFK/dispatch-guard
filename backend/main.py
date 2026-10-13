@@ -215,6 +215,10 @@ MENTION_PATH_RE = re.compile(r"""["']([^"'`]*\.[A-Za-z0-9]{1,12})["']""")
 
 _CONFIG_CACHE: dict[str, Any] = {"mtime": 0.0, "data": None, "source": None}
 _UNCONFIGURED_LOGGED = False
+# D14: mode=off keeps the middleware attached (so off→enforce hot-applies
+# without a session restart) and announces itself in the audit trail once
+# per off period — "what happened while it was off" stays visible.
+_OFF_LOGGED = False
 
 UNCONFIGURED = "unconfigured"
 SETUP_HINT = (
@@ -264,7 +268,12 @@ def _normalize_config(data: Any) -> dict[str, Any]:
         )
         cfg["ext_routes"] = {}
     routes = cfg.get("routes")
-    if not isinstance(routes, list):
+    if routes is None and "routes" not in cfg:
+        # D15: an absent key is a legal minimal config (ext_routes-only
+        # tables), not a type error — no warning. Only the explicit wrong
+        # type (including an explicit null) says so.
+        routes = []
+    elif not isinstance(routes, list):
         logger.warning(
             "dispatch-guard: routes.json 'routes' must be a JSON array; "
             "keyword routing is ignored"
@@ -429,6 +438,21 @@ def _load_config() -> dict[str, Any]:
             _CONFIG_CACHE["source"] = str(path)
             _lint_policy(data)
         except Exception:  # noqa: BLE001 - fail open
+            last_good = _CONFIG_CACHE["data"]
+            if isinstance(last_good, dict):
+                # D13: a half-written edit must not silently disarm the guard.
+                # The previous known-good table keeps every promise fail-open
+                # makes (never wedge the agent) without dropping authority;
+                # only a cold cache with no good table may fall to off. The
+                # mtime stays mismatched, so a fixed file hot-loads on the
+                # next call; each failed reload says so here.
+                logger.warning(
+                    "dispatch-guard: %s failed to load; continuing on the last "
+                    "known-good table — fix the file, this warning means the "
+                    "guard is enforcing yesterday's rules",
+                    path,
+                )
+                return last_good
             logger.exception("dispatch-guard: bad routes.json, failing open")
             return {"mode": "off", "routes": [], "ext_routes": {}}
         if origin == "plugin":
@@ -1374,9 +1398,33 @@ class DispatchGuardMiddleware(MiddlewareBase):
         cfg = _load_config()
         mode = cfg.get("mode", "enforce")
         if mode == "off":
+            # D14: off short-circuits here, not in the factory. Everything
+            # passes, but the first off-observed call after entering (or
+            # re-entering) off writes one audit record and a host-log line:
+            # operators keep visibility into what ran while disarmed, and
+            # flipping the table back to enforce hot-applies on the next
+            # mtime reload — no new session required.
+            global _OFF_LOGGED
+            if not _OFF_LOGGED:
+                _OFF_LOGGED = True
+                logger.info(
+                    "dispatch-guard: mode=off — attached and passing all tool "
+                    "calls (audit action=off marks the start of this period)"
+                )
+                self._log(
+                    {
+                        "action": "off",
+                        "tool": "*",
+                        "target": "",
+                        "mode": "off",
+                        "message": "guard disarmed by config; calls pass unexamined "
+                        "until mode returns to enforce/warn",
+                    }
+                )
             async for event in next_handler():
                 yield event
             return
+        _OFF_LOGGED = False
 
         tool_call = input_kwargs.get("tool_call")
         name, raw_input = _tool_call_parts(tool_call)
@@ -1559,9 +1607,11 @@ def _factory(ctx: Any, agent_config: Any) -> DispatchGuardMiddleware | None:
     agent_id = getattr(agent_config, "id", None) or getattr(ctx, "agent_id", None)
     if agent_id != "default":
         return None
+    # D14: the middleware attaches in EVERY mode. ``off`` short-circuits
+    # inside on_acting — cheap to carry, and it is what makes an
+    # off→enforce flip hot-apply by mtime instead of needing a new session.
+    # Detaching on off made disarmament one-way and left no audit at all.
     mode = _load_config().get("mode", "enforce")
-    if mode == "off":
-        return None
     workspace_dir = getattr(ctx, "workspace_dir", None)
     if not workspace_dir:
         return None

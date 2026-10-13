@@ -62,9 +62,9 @@ class DispatchGuardTest(unittest.TestCase):
         self.saved_agents_cache = dict(dg._AGENTS_CACHE)
         self.saved_draft_written = dg._DRAFT_WRITTEN
         self.saved_no_owner_logged = dg._NO_OWNER_LOGGED
-        # The host installs plugins outside the agent workspace; mirroring that is
-        # what keeps PLUGIN_DIR paths absolute through _rel() and lets the
-        # absolute-path-only plugin whitelist fire.
+        self.saved_off_logged = dg._OFF_LOGGED
+        # The host installs plugins outside the agent workspace; mirroring that
+        # keeps PLUGIN_DIR paths absolute through _rel().
         self.plugin_tmp = tempfile.TemporaryDirectory()
         self.plugin_tree = Path(self.plugin_tmp.name)
         self.routes_path = self.plugin_tree / "routes.json"
@@ -83,6 +83,7 @@ class DispatchGuardTest(unittest.TestCase):
         dg._AGENTS_CACHE.update(self.saved_agents_cache)
         dg._DRAFT_WRITTEN = self.saved_draft_written
         dg._NO_OWNER_LOGGED = self.saved_no_owner_logged
+        dg._OFF_LOGGED = self.saved_off_logged
         self.tmp.cleanup()
         self.plugin_tmp.cleanup()
 
@@ -96,6 +97,7 @@ class DispatchGuardTest(unittest.TestCase):
         dg._AGENTS_CACHE.update({"ws": None, "agents": None, "ids": frozenset()})
         dg._DRAFT_WRITTEN = False
         dg._NO_OWNER_LOGGED = False
+        dg._OFF_LOGGED = False
 
     def _inject_mode(self, mode):
         cfg = json.loads((REPO / "routes.example.json").read_text(encoding="utf-8"))
@@ -248,10 +250,30 @@ class DispatchGuardTest(unittest.TestCase):
         self.assertIsNone(dg._factory(FakeCtx(self.ws), FakeCfg("CodeAgent")))
         self.assertIsNotNone(dg._factory(FakeCtx(self.ws), FakeCfg("default")))
 
-    def test_mode_off_removes_factory(self):
+    def test_mode_off_stays_attached_with_minimal_audit(self):
+        # D14: the factory no longer detaches on off. The middleware
+        # short-circuits inside on_acting, so (a) an off→enforce flip
+        # hot-applies by mtime without a new session, and (b) the off
+        # period is not audit-blind: the first off-observed call records
+        # one action=off line, then stays quiet.
         self._inject_mode("off")
         try:
-            self.assertIsNone(dg._factory(FakeCtx(self.ws), FakeCfg("default")))
+            mw = dg._factory(FakeCtx(self.ws), FakeCfg("default"))
+            self.assertIsNotNone(mw, "off keeps the middleware attached (D14)")
+            r = run(mw, "write_file", {"file_path": "outputs/report.docx"})
+            self.assertNotEqual(r[0].state, "denied", "off passes everything")
+            records = self._audit_records()
+            self.assertEqual(records[-1]["action"], "off")
+            count = len(records)
+            run(mw, "write_file", {"file_path": "outputs/report.docx"})
+            self.assertEqual(
+                len(self._audit_records()), count, "off audits once per period"
+            )
+            # The asymmetry that D14 removed: flipping back hot-applies.
+            self._live_specialists()
+            self._inject_mode("enforce")
+            r = run(mw, "write_file", {"file_path": "outputs/report.docx"})
+            self.assertEqual(r[0].state, "denied", "enforce hot-loads after off")
         finally:
             self._inject_mode("enforce")
 
@@ -300,12 +322,17 @@ class DispatchGuardTest(unittest.TestCase):
 
     def test_malformed_routes_json_still_fails_open(self):
         # Distinct from a missing file: a table we cannot read must not become a
-        # blanket blocker, so the pre-0.1.2 fail-open design stands.
+        # blanket blocker, so the pre-0.1.2 fail-open design stands. After
+        # D14 "failing open" means attached-and-passing (off short-circuits
+        # in on_acting), not detached — the guarantee is that nothing blocks.
         self._fresh_plugin_tree("{ not json")
         with self.assertLogs("dispatch_guard.qwenpaw", level="ERROR") as logs:
             self.assertEqual(dg._load_config()["mode"], "off")
-            self.assertIsNone(dg._factory(FakeCtx(self.ws), FakeCfg("default")))
+            mw = dg._factory(FakeCtx(self.ws), FakeCfg("default"))
+            self.assertIsNotNone(mw, "D14: off keeps the middleware attached")
         self.assertTrue(any("failing open" in line for line in logs.output))
+        r = run(mw, "write_file", {"file_path": "outputs/report.docx"})
+        self.assertNotEqual(r[0].state, "denied", "a broken table blocks nothing")
 
     # -- environment discovery: no owner, no block --------------------------
 

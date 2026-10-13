@@ -8,6 +8,7 @@ routes.json files, global caches saved and restored).
 """
 import asyncio
 import json
+import logging
 import sys
 import tempfile
 import unittest
@@ -48,6 +49,7 @@ class ReviewRegressionTest(unittest.TestCase):
         self.saved_agents_cache = dict(dg._AGENTS_CACHE)
         self.saved_draft_written = dg._DRAFT_WRITTEN
         self.saved_no_owner_logged = dg._NO_OWNER_LOGGED
+        self.saved_off_logged = dg._OFF_LOGGED
         # The host installs plugins outside the agent workspace; mirroring that
         # keeps PLUGIN_DIR paths absolute through _rel().
         self.plugin_tmp = tempfile.TemporaryDirectory()
@@ -67,6 +69,7 @@ class ReviewRegressionTest(unittest.TestCase):
         dg._AGENTS_CACHE.update(self.saved_agents_cache)
         dg._DRAFT_WRITTEN = self.saved_draft_written
         dg._NO_OWNER_LOGGED = self.saved_no_owner_logged
+        dg._OFF_LOGGED = self.saved_off_logged
         self.tmp.cleanup()
         self.plugin_tmp.cleanup()
 
@@ -77,6 +80,7 @@ class ReviewRegressionTest(unittest.TestCase):
         dg._AGENTS_CACHE.update({"ws": None, "agents": None, "ids": frozenset()})
         dg._DRAFT_WRITTEN = False
         dg._NO_OWNER_LOGGED = False
+        dg._OFF_LOGGED = False
 
     def _write_config(self, cfg):
         self.routes_path.write_text(
@@ -394,6 +398,61 @@ class ReviewRegressionTest(unittest.TestCase):
         self.assertNotIn(secret, text)
         self.assertIn("sha256:", text)
         self.assertIn("[redacted]", text)
+
+    # -- D13: a broken reload keeps the last known-good table ---------------
+
+    def test_parse_failure_keeps_last_known_good_table(self):
+        # review D13: a half-written routes.json used to fail open to "off"
+        # (silent disarmament) even though the cache held a good table.
+        self._write_config(
+            {"mode": "enforce", "ext_routes": {".docx": "DocAgent"}, "routes": []}
+        )
+        r = run(self.mw, "write_file", {"file_path": "outputs/a.docx"})
+        self.assertEqual(r[0].state, "denied")
+        self.routes_path.write_text("{ half-written", encoding="utf-8")
+        dg._CONFIG_CACHE["mtime"] = 0.0  # force the next call to re-read
+        r = run(self.mw, "write_file", {"file_path": "outputs/a.docx"})
+        self.assertEqual(r[0].state, "denied", "last-known-good stays in force")
+        # cold cache + broken file: nothing to keep, still fails open to off.
+        dg._CONFIG_CACHE.update({"data": None, "mtime": 0.0, "source": None})
+        r = run(self.mw, "write_file", {"file_path": "outputs/a.docx"})
+        self.assertNotEqual(r[0].state, "denied")
+
+    # -- D15: a missing routes key is legal, not a type error ---------------
+
+    def test_missing_routes_key_produces_no_wrong_type_warning(self):
+        # review D15: minimal {"mode":…,"ext_routes":…} tables spammed the
+        # "'routes' must be a JSON array" warning on every load — missing
+        # key and wrong type are different facts.
+        def _warnings_for(cfg_obj):
+            self.routes_path.write_text(
+                json.dumps(cfg_obj, ensure_ascii=False), encoding="utf-8"
+            )
+            dg._CONFIG_CACHE.update({"data": None, "mtime": 0.0, "source": None})
+            messages: list[str] = []
+
+            class _Capture(logging.Handler):
+                def emit(self, record):
+                    messages.append(record.getMessage())
+
+            h = _Capture()
+            dg.logger.addHandler(h)
+            try:
+                dg._load_config()
+            finally:
+                dg.logger.removeHandler(h)
+            return [m for m in messages if "must be a JSON array" in m]
+
+        self.assertEqual(
+            _warnings_for({"mode": "enforce", "ext_routes": {".docx": "DocAgent"}}),
+            [],
+            "absent routes key must stay quiet",
+        )
+        self.assertEqual(
+            len(_warnings_for({"mode": "enforce", "routes": None})),
+            1,
+            "explicit null routes is still a type error worth flagging",
+        )
 
 
 if __name__ == "__main__":
