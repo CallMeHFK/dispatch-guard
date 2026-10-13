@@ -719,9 +719,18 @@ _DRAFT_PRESETS = (
 
 
 def _parse_agent_manifest(path: Path) -> dict[str, Any] | None:
+    # OSError is deliberately not caught here (B4). A manifest that exists
+    # but cannot be read means the walk did not succeed, and swallowing it
+    # turned a permission wall into an empty inventory that
+    # _discover_agents reported as readable — the guard then stood down
+    # over a layout it had never read, which is the fail-open D8 exists to
+    # prevent. Letting it reach _discover_agents' handler reports the whole
+    # inventory as unreadable instead, and keeps it out of the cache so the
+    # next call retries. Only a file that WAS read and does not describe an
+    # agent returns None.
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
+    except ValueError:
         return None
     if not isinstance(data, dict):
         return None
@@ -831,10 +840,13 @@ def _discover_agents(ws: str | Path) -> tuple[list[dict[str, Any]], bool]:
     """(agents, readable) — agents installed in this environment, cached per
     workspace until the inventory inputs change (see _inventory_stamp).
 
-    ``readable`` says whether the walk itself succeeded. An empty inventory
-    with ``readable=True`` is a genuine single-agent deployment, not a
+    ``readable`` says whether the walk succeeded: the glob ran AND every
+    manifest it matched was actually read. An empty inventory with
+    ``readable=True`` is therefore a genuine single-agent deployment, not a
     layout we failed to parse — the distinction decides ``_live_owner``'s
-    no_owner-vs-trust-table verdict (D8).
+    no_owner-vs-trust-table verdict (D8). A manifest that exists but cannot
+    be read makes the whole inventory unreadable (B4); dropping it silently
+    used to report a permission wall as "no specialists here".
 
     ``default`` (the orchestrator this middleware attaches to) and explicitly
     disabled agents are never dispatch targets and are left out.

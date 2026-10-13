@@ -411,6 +411,30 @@ class DispatchGuardTest(unittest.TestCase):
         self.assertNotEqual(r[0].state, "denied")
         self.assertEqual(self._audit_records()[-1]["action"], "no_owner")
 
+    def test_unreadable_manifest_keeps_guard_armed(self):
+        # B4: D8's readable flag meant "the glob did not raise". A manifest
+        # that exists but cannot be read was dropped by
+        # _parse_agent_manifest's OSError handler, so the empty result was
+        # reported as a genuine single-agent deployment and the guard stood
+        # down over a layout it had never actually read — the fail-open D8
+        # was meant to close, arrived at by a different route.
+        #
+        # A dangling symlink stands in for a permission wall: both surface as
+        # OSError from read_text, and this form does not depend on the uid
+        # the suite happens to run under (chmod 0o000 is a no-op for root).
+        d = Path(self.ws) / "agents" / "DocAgent"
+        d.mkdir(parents=True)
+        (d / "agent.json").symlink_to(Path(self.ws) / "agents" / "gone.json")
+        self._bust_config_cache()
+        agents, readable = dg._discover_agents(self.ws)
+        self.assertEqual(agents, [])
+        self.assertFalse(
+            readable, "an unreadable manifest is not a readable-empty inventory"
+        )
+        self._bust_config_cache()
+        r = run(self.mw, "write_file", {"file_path": "outputs/report.docx"})
+        self.assertEqual(r[0].state, "denied")
+
     def test_unreadable_inventory_block_names_no_invented_agent(self):
         # D8 wording rule: when the table is trusted but discovery failed
         # and the class has no route-named owner, the deny must NOT point
