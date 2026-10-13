@@ -220,12 +220,15 @@ operation are invisible to the guard, in all modes:
   included, whichever shape the path arrives in — a plain string, a list or
   dict value, an upper-case or trailing-dot spelling. Through
   `execute_shell_command` the same two files are matched **by their real
-  path** (plugin directory or plugin-data mirror): naming one warns, mutating
-  one — a redirect, `tee`, `sed -i`, `rm`/`mv`/`truncate`, an in-process
-  `open(..., "w")` — is refused. Bare basenames are never matched, so a
-  project that owns its own `routes.json` can still read, grep, copy and
-  delete it. The table is what the guard is made of; the guarded agent must
-  not hold the eraser.
+  path** (plugin directory or plugin-data mirror, absolute or `~`-spelled,
+  case-insensitively, and never past a path boundary — `routes.json.bak` is
+  a backup, not the table), or by a bare basename after the command has
+  `cd`'d into a guard home: naming one warns, mutating one — a redirect,
+  `tee`, `sed -i`, `rm`/`mv`/`truncate`/`ln`, an in-process
+  `open(..., "w")` — is refused. Bare basenames elsewhere are never matched,
+  so a project that owns its own `routes.json` can still read, grep, copy
+  and delete it. The table is what the guard is made of; the guarded agent
+  must not hold the eraser.
 - any other non-deliverable write: notes, scripts, configs, scratch and
   extension-less files anywhere in the workspace
 

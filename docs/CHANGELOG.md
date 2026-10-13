@@ -17,6 +17,12 @@ Adversarial review 2026-10-12 (`review-20261012.md`) found 17 defects
 (D1–D17) plus fail-open consistency items (F1–F18). Every fix landed on
 `fix/review-20261012`; the review's 12-case evidence pack now passes 12/12,
 and the repository suite covers every finding with targeted regression tests.
+A second review pass over the fixes found ten more defects (B1–B10 —
+a shell-arm false-positive surface, audit redaction gaps, meta-integrity
+bypasses by mode, path shape, case and `cd`, a discovery fail-open, a
+canonicalisation bypass, coverage gaps, a `~`-spelling hole, a gate that
+could crash the middleware, and a strings walker that capped out) — all
+closed and pinned by regressions on this branch.
 
 - **D1 (Blocker) — the guarded agent can no longer rewrite its own dispatch
   table.** `routes.json`/`routes.draft.json` basenames are excluded from
@@ -26,9 +32,16 @@ and the repository suite covers every finding with targeted regression tests.
   trailing dot) — and only lint-clean tables mirror into plugin-data.
   The shell arm (D1-shell) matches the guard's two **real table paths**, not
   the bare basename: naming one warns, mutating one (redirect, `tee`,
-  `sed -i`, `rm`/`mv`/`truncate`, an in-process `open(..., "w")`) is refused
-  in every mode and regardless of `shell_enforce`. A project's own
-  `routes.json` is never matched, so reading or grepping it stays untouched.
+  `sed -i`, `rm`/`mv`/`truncate`/`ln`, an in-process `open(..., "w")`) is
+  refused in every mode and regardless of `shell_enforce`. Matching is
+  case-insensitive and boundary-anchored (`routes.json.bak` is a backup, not
+  the table; `ROUTES.JSON` IS the table on a case-insensitive host), expands
+  `~`, and also covers a bare basename after a `cd` into a guard home in the
+  same command. A project's own `routes.json` is never matched, so reading
+  or grepping it stays untouched. The meta-integrity gate itself is total —
+  it runs above the fail-open wrapper, and an unserializable input used to
+  raise TypeError out of the middleware through it; it now fails open like
+  everything else under F17.
 - **D2 — dict-shaped `tool_call` no longer disarms the guard.** `on_acting`
   accepts Mapping-shaped calls; an unrecognizable shape is audited and
   spawn-suspect payloads are refused under the most conservative reading.

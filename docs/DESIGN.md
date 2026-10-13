@@ -46,8 +46,10 @@ applies, so it cannot be protected by a rule the table itself can switch off.
 The match is on the real path, never on the bare basename. `routes.json` is an
 ordinary filename that plenty of projects own, and refusing every command that
 mentions one breaks those projects — including this repository — for no gain
-in security, since a relative spelling cannot reach a plugin directory
-outside the workspace.
+in security. The two exceptions where a spelling still resolves to the table:
+the `~`-compressed form of a real home, and a bare basename after a `cd` into
+a guard home in the same command line — both are expanded or resolved before
+judging, so neither buys an escape.
 
 ## Why only deliverable-shaped writes
 

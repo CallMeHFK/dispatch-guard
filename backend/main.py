@@ -158,8 +158,10 @@ _GUARD_CONFIG_NAMES = frozenset({"routes.json", "routes.draft.json"})
 # basename. Matching the basename denied every read of every file called
 # routes.json — `cat src/routes.json`, `grep -n docx routes.json`, even
 # `rm -rf /tmp/x # routes.json` — which breaks any project that owns one,
-# this repository included. A relative spelling also cannot reach a plugin
-# directory outside the workspace, so the basename was never the threat.
+# this repository included. The one place a bare basename does count is after
+# a `cd` into a guard home in the same command, because the basename then
+# resolves against that directory (B9); everywhere else it is somebody else's
+# file.
 #
 # Two tiers, the ones DESIGN.md defines: naming one of those paths is a
 # warning, mutating it is a refusal. The mutate test below is deliberately
