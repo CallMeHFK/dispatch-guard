@@ -35,6 +35,20 @@ class PrivatePayloadGuardTest(unittest.TestCase):
     def test_example_table_is_allowed(self):
         self.assertEqual(bp.find_private_payload([PurePosixPath("routes.example.json")]), [])
 
+    def test_nested_copies_are_refused(self):
+        # review D17: the check used to match root-level exact names only —
+        # a backend/routes.json or sub/routes.draft.json would have slipped
+        # into the published archive at any depth.
+        found = bp.find_private_payload(
+            [
+                PurePosixPath("backend/routes.json"),
+                PurePosixPath("sub/routes.draft.json"),
+                PurePosixPath("routes.example.json"),
+                PurePosixPath("docs/routes.md"),
+            ]
+        )
+        self.assertEqual(found, ["backend/routes.json", "sub/routes.draft.json"])
+
     def test_repo_does_not_track_a_real_table(self):
         tracked = subprocess.run(
             ["git", "ls-files", "routes.json"],

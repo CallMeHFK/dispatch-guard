@@ -101,8 +101,20 @@ def _git_tracked(root: Path) -> list[Path] | None:
 
 
 def find_private_payload(rel_paths) -> list[str]:
-    """Return repo-relative paths that must never enter a published archive."""
-    return sorted(str(p) for p in rel_paths if str(p) in PRIVATE_PAYLOAD)
+    """Return repo-relative paths that must never enter a published archive.
+
+    Name-based, not root-exact (D17): the threat is any copy of a live
+    dispatch table reaching the zip, so ``backend/routes.json`` or
+    ``sub/routes.draft.json`` must be caught too, not only a root-level
+    file with that exact name. ``routes.example.json`` (the sanitized
+    shipped table) is unaffected — it is a different name.
+    """
+    hits = []
+    for p in rel_paths:
+        s = str(p).replace("\\", "/")
+        if PurePosixPath(s).name in PRIVATE_PAYLOAD:
+            hits.append(s)
+    return sorted(hits)
 
 
 def build(plugin_id: str, version: str) -> Path:
