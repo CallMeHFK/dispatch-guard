@@ -508,6 +508,41 @@ class ReviewRegressionTest(unittest.TestCase):
             "explicit null routes is still a type error worth flagging",
         )
 
+    # -- B2 (Phase 3): the D2 unknown-shape path logged str(tool_call)
+    #    verbatim — D10's redaction only covered the spawn branch. Both the
+    #    deny and the warn leg must persist the digest form, never raw text.
+
+    def test_unknown_shape_denial_does_not_persist_secret(self):
+        # Each payload stays under the 80-char excerpt cap so the assertion
+        # tests redaction itself, not accidental truncation.
+        cases = {
+            "sk-LIVE-TOKEN-9f2b": "spawn a worker, auth sk-LIVE-TOKEN-9f2b",
+            "Correct-Horse-Battery-Staple": (
+                "spawn a worker, password is Correct-Horse-Battery-Staple"
+            ),
+            "AKIAIOSFODNN7EXAMPLE": "spawn a worker, key AKIAIOSFODNN7EXAMPLE",
+            "token=hunter2example": "spawn a worker, token=hunter2example",
+            "Bearer Zxy9abc123Q": "spawn a worker, header Bearer Zxy9abc123Q",
+        }
+        log = Path(self.ws) / "logs" / "dispatch_guard.jsonl"
+        for secret, payload in cases.items():
+            with self.subTest(secret=secret):
+                r = run(self.mw, "x", None, call={"payload": payload})
+                self.assertEqual(r[0].state, "denied")
+                text = log.read_text(encoding="utf-8")
+                self.assertNotIn(secret, text)
+        self.assertIn("sha256:", log.read_text(encoding="utf-8"))
+
+    def test_unknown_shape_warn_does_not_persist_secret(self):
+        secret = "sk-LIVE-TOKEN-9f2b"
+        # No spawn smell -> the warned/pass leg of the unknown-shape branch.
+        r = run(self.mw, "x", None, call={"payload": f"odd shape carrying {secret}"})
+        self.assertNotEqual(r[0].state, "denied")
+        log = Path(self.ws) / "logs" / "dispatch_guard.jsonl"
+        text = log.read_text(encoding="utf-8")
+        self.assertNotIn(secret, text)
+        self.assertIn("sha256:", text)
+
 
 if __name__ == "__main__":
     unittest.main()

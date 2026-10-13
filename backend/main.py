@@ -589,17 +589,30 @@ def _canonical_target(p: str) -> str:
 # audit log's readership is wider than the credential holders'. The record
 # now carries only a hash (identity/dedup), the length, and a redacted
 # excerpt; raw input never reaches the jsonl.
+#
+# The patterns are a known-shape filter, not a secret scanner: they catch the
+# spellings that actually turn up in task text (provider keys, AWS access key
+# ids, bearer headers, ``key=value`` and ``key is value`` assignments) and
+# nothing else. A credential in some other shape still reaches the excerpt —
+# which is why the excerpt is capped and the hash, not the text, is the
+# record's identity. Redaction lowers the exposure surface; it does not close
+# it, and the docs say so rather than promising the impossible.
 _SECRET_PATTERNS = (
     re.compile(r"\bsk-[A-Za-z0-9_-]{4,}"),
+    # AWS access key id / temporary credential id.
+    re.compile(r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b"),
+    # Authorization header value: "Bearer <token>" is space-separated, so the
+    # key=value pattern below never sees it.
+    re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._~+/=-]{8,}"),
     re.compile(
-        r"(?i)\b(?:api[_-]?key|access[_-]?token|token|secret|passw(?:ord|ork)|"
-        r"bearer|authorization)\b\s*[:=]\s*[^\s,;\"']+"
+        r"(?i)\b(?:api[_-]?key|access[_-]?token|token|secret|passw(?:ord|ork|rase)|"
+        r"bearer|authorization|credential)\b\s*(?:[:=]|\bis\b|\bare\b)\s*[^\s,;\"']+"
     ),
 )
 
 
-def _spawn_audit_target(raw: str) -> str:
-    """Digest form of a spawn denial's target for the audit trail (D10)."""
+def _redacted_audit_target(raw: str) -> str:
+    """Digest form of a denial's target for the audit trail (D10)."""
     text = raw if isinstance(raw, str) else str(raw)
     redacted = text
     for pat in _SECRET_PATTERNS:
@@ -1445,13 +1458,20 @@ class DispatchGuardMiddleware(MiddlewareBase):
             # D2: an unrecognizable tool_call shape must not silently disarm
             # the guard. Audit it; when anything about it smells like a spawn
             # call, refuse outright — the most conservative reading.
-            blob = str(tool_call)[:300]
+            #
+            # The smell test reads the raw text, but the audit record does not
+            # carry it: an unrecognizable shape is exactly the case where the
+            # guard cannot tell a spawn body from anything else, so it gets the
+            # same D10 digest treatment as the spawn backstop. Logging the blob
+            # verbatim here would have reopened D10 on a new path.
+            blob = str(tool_call)
+            audit_target = _redacted_audit_target(blob)
             if "spawn" in blob.lower():
                 yield self._deny(
                     "dispatch-guard: 无法识别的 tool_call 形状且疑似 spawn "
                     "调用，按最保守策略拒绝（D2）。",
                     "unknown",
-                    blob,
+                    audit_target,
                     mode,
                 )
                 return
@@ -1459,7 +1479,7 @@ class DispatchGuardMiddleware(MiddlewareBase):
                 {
                     "action": "warned",
                     "tool": "unknown",
-                    "target": blob,
+                    "target": audit_target,
                     "mode": mode,
                     "message": "dispatch-guard: 无法识别的 tool_call 形状；"
                     "已放行并记录（D2）",
@@ -1510,13 +1530,14 @@ class DispatchGuardMiddleware(MiddlewareBase):
         target, target_is_path = self._target_of(raw_input)
 
         if name in SPAWN_TOOLS:
+            # D10: the spawn input body is not audit-log material — task
+            # text carries credentials, and the log outlives the call.
+            spawn_target = target if isinstance(target, str) else str(target)
             yield self._deny(
                 "spawn_subagent 已停用（配置层禁用）。盲评或并行 worker 请用 "
                 "chat_with_agent / submit_to_agent 派给专业 agent。",
                 name,
-                # D10: the spawn input body is not audit-log material — task
-                # text carries credentials, and the log outlives the call.
-                _spawn_audit_target(target if isinstance(target, str) else str(target)),
+                _redacted_audit_target(spawn_target),
                 mode,
             )
             return
