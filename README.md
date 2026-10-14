@@ -315,28 +315,37 @@ exception in the host log) — a table we cannot read must not become a
 blanket blocker, and a table we read *yesterday* still must not become a
 blanket pass-through.
 
-### jev: opt-in semantic arbitration (P0)
+### jev: opt-in semantic arbitration (P0 draft + P1 blind-spot)
 
-With `jev.enabled: true`, the draft generator gains a semantic layer between
-the orchestrator's declared dispatch policy (which always wins, and is never
-charged judge latency) and the keyword scan: one judge call asks which live
-agent owns each deliverable category, and only **certain answers naming a
-live agent** count. An "unrouted" answer, sub-threshold confidence, a judge
-naming an agent that is not installed, or a dead/slow/garbled judge all fall
-back to the keyword scan — the scan is the fallback, never replaced, and the
-hook fails open on any internal error. Judge endpoints and models come from
-the jev-kernel plugin's own `jev.json` (`inherit:jev-kernel`; `$JEV_KERNEL_CONFIG`
-→ jev-kernel's plugin directory → its plugin-data copy, in that order), the
-`tiers` whitelist pins which of those judges may be dialed, and jev-kernel's
-global `enabled: false` is authoritative — a parked kernel disables this
-layer too. The wire dialect is a stdlib mirror of jev-kernel's raw
-`systemone` protocol, pinned by contract tests against a fake server.
-Decisions land in the audit trail under a `jev` subobject
+With `jev.enabled: true`, two decision points gain a semantic layer over the
+deterministic rules, served by a local System One judge:
+
+- **P0 — draft generation.** The draft generator sits a semantic layer between
+  the orchestrator's declared dispatch policy (which always wins, and is never
+  charged judge latency) and the keyword scan: one judge call asks which live
+  agent owns each deliverable category, and only **certain answers naming a
+  live agent** count. An "unrouted" answer, sub-threshold confidence, a judge
+  naming an agent that is not installed, or a dead/slow/garbled judge all fall
+  back to the keyword scan — the scan is the fallback, never replaced.
+- **P1 — blind-spot arbitration.** A deliverable-shaped write whose keyword
+  route names no live owner (otherwise a silent `no_owner` pass) gets one
+  Choice arbitration over the live inventory plus `basic_op`/`none`. Gating:
+  p ≥ `deny` (0.85) in enforce denies naming the owner; `warn` (0.6) ≤ p <
+  `deny` warns naming the owner; anything less certain is the unchanged
+  silent pass. L1 hits, the inventory-read-failure branch and the
+  meta-integrity gate pay zero judge calls.
+
+Both hooks fail open on any internal error. Judge endpoints and models come
+from the jev-kernel plugin's own `jev.json` (`inherit:jev-kernel`;
+`$JEV_KERNEL_CONFIG` → jev-kernel's plugin directory → its plugin-data copy,
+in that order), the `tiers` whitelist pins which of those judges may be
+dialed, and jev-kernel's global `enabled: false` is authoritative — a parked
+kernel disables this layer too. The wire dialect is a stdlib mirror of
+jev-kernel's raw `systemone` protocol, pinned by contract tests against a
+fake server. Decisions land in the audit trail under a `jev` subobject
 (`{judge, latencyMs, probability, value, fallback}`); set `record: false` to
-suppress that. Scope note: P0 covers draft generation only — online
-blind-spot arbitration (P1) and shell-mention escalation (P2) are designed
-in [docs/JEV_INTEGRATION.md](docs/JEV_INTEGRATION.md) and intentionally not
-implemented yet.
+suppress that. Shell-mention escalation (P2) stays unimplemented by design —
+see [docs/JEV_INTEGRATION.md](docs/JEV_INTEGRATION.md).
 
 ## Logging
 
