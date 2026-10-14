@@ -1,7 +1,7 @@
 # dispatch-guard × Jev 接入方案（v4：Han 定 judge=lux 单 tier）
 
 基线：dispatch-guard **v0.1.10**（origin/main，评审修复 D1–D17/F17 + 二轮 B1–B10 已合回）× jev-kernel **v0.2.1**（origin/main，hardening PR #1 已 ff 合入本地）。
-状态：**P0 已实施**（分支 `feat/jev-arbitration`，未合并 main）：`backend/jev.py`（stdlib systemone 客户端 + `inherit:jev-kernel` 解析）+ `_draft_route_table` 草稿挂钩 + 审计子对象；P1（盲区仲裁 `_guard_target`）/P2（shell mention Noul）未做。本文件即实施方案原文。
+状态：**P0 + P1 已实施**（分支 `feat/jev-arbitration`，未合并 main）。P0：`backend/jev.py`（stdlib systemone 客户端 + `inherit:jev-kernel` 解析）+ `_draft_route_table` 草稿挂钩 + 审计子对象。P1：盲区语义仲裁——`_jev_blindspot` 助手挂在 `_guard_target` 的 `not blockable` 分支（`_no_owner_pass` 调用前），复用 `backend/jev.py`，只把达门控的 judge 选择交回现有 deny/warn 路径（见 §3 P1 落地）。P2（shell mention Noul）未做。本文件即实施方案原文。
 模型信息源：jev-kernel 运行时配置 `~/.qwenpaw/plugin-data/jev-kernel/jev.json`（本地 judge 链，非 TypeSafe 云）。
 
 **v3→v4 变更摘要（Han 决策：用 lux）**：① judge 收敛为 **lux 单 tier**（实测 121ms），clef/session 不接入——级联、48s 最坏延迟、session provider 暴露面全部作废；② 配置形态改为 `inherit:jev-kernel` + `tiers:["lux"]`（endpoint 单一事实源保留，tier 白名单锁 lux）；③ lux 失败即 L3 fail-open（P0 回落关键词扫描 / P1 走现行 no_owner），无下一级可级联；④ rubric 第 8 条改为「lux 宕机 fail-open」断言，死 tier 级联测试作废。
@@ -63,6 +63,8 @@ wire 协议（jev-kernel `backend/judges.py`，参照 mu-agent 0.1.8 验证）�
 - 解析出 owner（p 达门控）→ 交回现有 deny/warn 路径（owner 由构造保证 live，`_live_owner` 复核仍过）。
 - **不挂** v0.1.10 新增第三分支（`owner is None and blockable` = inventory 读取失败）：无 inventory 即无 criteria 可言，保持「回报用户确认归属」语义。
 - jev 调用位于 F17 fail-open wrapper 内：超时/异常/非 JSON → 直接走现行 `_no_owner_pass`，审计记 fallback（lux 单 tier，无级联）。
+
+**P1 落地（分支已实施）**：助手 `_jev_blindspot(rel, tool, mode=, allow_deny=)` 在 `_guard_target` 的 `not blockable` 分支、`_no_owner_pass` 之前调用；发一个 Choice 问（criteria = live agent id（description 截断 200）+ `basic_op` + `none`，state = `{target,tool,ext,agents:[…]}`）。达门控的 owner 先经 `_live_owner(value)` 复核仍 blockable，才交回现有 deny/warn 文案（复用点名格式）。off／无 specialist／configured-but-unrunnable／超时／异常／非 JSON 一律退化为逐字一致的现行 no_owner。回归隔离靠**只增不改**：`_deny`/`_warn_and_pass`/`_no_owner_pass` 各加一个可选 `jev=` 关键字，仅在带仲裁时挂审计子对象，其它路径记录字节不变。第三分支（inventory 读取失败）不挂钩，L1 命中与 D1 元写零 judge 调用由结构保证。测试：`tests/test_jev_blindspot.py`（rubric 1–6/8/9，假 systemone 服务器）。
 
 **P2 · shell mention Noul（DESIGN.md mention 层）— 后置可砍。** p ≥ 0.85 才把 mention 级警告升级为 explicit-target 级警告；永不因 noul deny。
 
