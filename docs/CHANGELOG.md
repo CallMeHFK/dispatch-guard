@@ -1,5 +1,41 @@
 # Changelog
 
+## v0.1.11 — jev semantic arbitration layer (opt-in)
+
+An opt-in L2 semantic arbitration layer for the two points where the
+deterministic rules cannot decide. Judges are local System One services
+inherited from the jev-kernel plugin's configuration (single-tier
+whitelist); nothing reaches a cloud provider unless the operator
+configures one inline.
+
+- **P0 draft hook**: with jev enabled, `routes.draft.json` generation asks
+  one Choice question per deliverable category in a single request
+  (criteria = live agent ids + `unrouted`); uncertain or failed arbitration
+  falls back to the keyword scan per category, so a draft never comes up
+  empty.
+- **P1 blind-spot hook**: a deliverable-shaped write whose keyword route
+  names no live owner — previously a silent `no_owner` pass — gets one
+  Choice arbitration (criteria = live agents + `basic_op` + `none`).
+  Gating: p ≥ deny (0.85) with enforce denies naming the owner;
+  warn (0.6) ≤ p < deny warns naming the owner; everything else is the
+  unchanged pre-jev pass. The inventory-read-failure branch, L1 hits and
+  the meta-integrity gate pay zero judge calls.
+- **`backend/jev.py`**: stdlib-only System One client (raw dialect: baseUrl
+  normalisation, noul/criteria translation, answer normalisation) mirroring
+  jev-kernel's tested transports; `inherit:jev-kernel` resolves judge specs
+  from the kernel's config (plugin dir → plugin-data) and honours its global
+  kill-switch; hard timeout cap; every judge failure fails open (F17).
+- **Audit**: records carry an optional `jev` subobject
+  `{judge, latencyMs, probability, value, fallback}`; every other path stays
+  byte-identical.
+- **Config**: `jev` block in `routes.json` (`enabled` default false,
+  `judges`, `tiers`, `thresholds`, `online_timeout_ms`, `record`); wrong
+  types degrade per field. Absent or disabled block = byte-identical to
+  v0.1.10.
+- Docs: `docs/JEV_INTEGRATION.md` (design + measured latencies), README jev
+  section and privacy wording. 210 tests (62 jev-layer tests across client,
+  draft and blind-spot suites), ruff clean.
+
 ## v0.1.10 — v0.1.9 评审修复 (review-20261012)
 
 Adversarial review 2026-10-12 (`review-20261012.md`) found 17 defects
