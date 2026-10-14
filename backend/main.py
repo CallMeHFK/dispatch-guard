@@ -1695,6 +1695,8 @@ class DispatchGuardMiddleware(MiddlewareBase):
         target: str,
         mode: str,
         next_handler: Callable[..., AsyncGenerator[Any, None]],
+        *,
+        jev: dict[str, Any] | None = None,
     ) -> AsyncGenerator[Any, None]:
         """Pass a deliverable-shaped write whose owner does not exist here.
 
@@ -1702,17 +1704,22 @@ class DispatchGuardMiddleware(MiddlewareBase):
         the exact failure that trains operators to turn the guard off. The
         pass is silent to the agent (a warning naming no one is noise) and
         audible in the audit trail.
+
+        ``jev`` (P1) is the arbitration subobject for a blind-spot write the
+        semantic layer weighed; it is attached only when present, so a pass
+        from any other path stays byte-identical to the pre-jev plugin.
         """
         global _NO_OWNER_LOGGED
-        self._log(
-            {
-                "action": "no_owner",
-                "tool": tool_name,
-                "target": target,
-                "mode": mode,
-                "message": reason,
-            }
-        )
+        record: dict[str, Any] = {
+            "action": "no_owner",
+            "tool": tool_name,
+            "target": target,
+            "mode": mode,
+            "message": reason,
+        }
+        if jev is not None:
+            record["jev"] = jev
+        self._log(record)
         if not _NO_OWNER_LOGGED:
             _NO_OWNER_LOGGED = True
             logger.warning(
@@ -1722,6 +1729,124 @@ class DispatchGuardMiddleware(MiddlewareBase):
             )
         async for event in next_handler():
             yield event
+
+    def _jev_blindspot(
+        self,
+        rel: str,
+        tool_name: str,
+        *,
+        mode: str,
+        allow_deny: bool,
+    ) -> dict[str, Any]:
+        """P1 semantic arbitration of a silent no_owner blind spot.
+
+        Reached only from ``_guard_target``'s ``not blockable`` branch — a
+        deliverable whose keyword route named no live owner in a readable,
+        non-empty inventory. That branch used to pass with no owner and no
+        second look; this asks the local judge which specialist owns the
+        target, then hands a confident pick back to the existing deny/warn
+        path. It never raises and never acts on what the judge is unsure of:
+        an absent, disabled, dead or uncertain layer — or an inventory with
+        no specialists to name — degrades to the exact pre-jev no_owner pass
+        (D4 gating, D7 precedence, F17 fail-open).
+
+        Returns a decision dict:
+          ran=False → off / no specialists to name; the caller reproduces the
+                      pre-jev pass byte-for-byte (no jev audit, zero requests).
+          else      → {"action": deny|warn|no_owner, "owner": str|None,
+                       "why": str, "jev": subobject|None}.
+        """
+        agents = _AGENTS_CACHE["agents"] or []
+        if _jev is None or not agents:
+            return {"ran": False, "action": "no_owner", "owner": None,
+                    "why": "", "jev": None}
+        live_ids = {str(a["id"]) for a in agents}
+        try:
+            runtime, reason, record = _jev.resolve(_load_config(), PLUGIN_DIR)
+        except Exception:  # noqa: BLE001 - arbitration fails open to no_owner
+            logger.exception("dispatch-guard: jev blind-spot resolve failed")
+            return {"ran": True, "action": "no_owner", "owner": None,
+                    "why": "", "jev": None}
+        if runtime is None:
+            # Configured but unable to run (no kernel config / kill-switch / no
+            # whitelisted tier) is audited; simply off is byte-identical.
+            jev_rec = None
+            if reason is not None and record:
+                jev_rec = {"judge": None, "latencyMs": 0.0, "probability": 0.0,
+                           "value": None, "fallback": reason}
+            return {"ran": True, "action": "no_owner", "owner": None,
+                    "why": "", "jev": jev_rec}
+
+        criteria = {
+            str(a["id"]): (str(a.get("description") or "")[:200] or str(a["id"]))
+            for a in agents
+        }
+        criteria["basic_op"] = (
+            "orchestration's own bookkeeping or a meta output; no specialist owns it"
+        )
+        criteria["none"] = "no listed specialist fits this target"
+        state = {
+            "target": rel,
+            "tool": tool_name,
+            "ext": os.path.splitext(rel)[1].lower(),
+            "agents": [
+                {
+                    "id": str(a["id"]),
+                    "skills": [str(s) for s in a.get("skills", [])],
+                    "description": str(a.get("description") or "")[:200],
+                }
+                for a in agents
+            ],
+        }
+        questions = {
+            "q0": {
+                "type": "choice",
+                "instructions": (
+                    "Which specialist should own this deliverable? It matched "
+                    "no route and its table owner is not installed. Answer "
+                    "'basic_op' when this is orchestration bookkeeping or a "
+                    "meta output, and 'none' when no listed specialist fits."
+                ),
+                "criteria": criteria,
+            }
+        }
+        try:
+            verdicts, call_audit = _jev.ask(runtime, state, questions)
+        except Exception:  # noqa: BLE001 - a judge must never wedge the agent
+            logger.exception("dispatch-guard: jev blind-spot call failed")
+            return {"ran": True, "action": "no_owner", "owner": None,
+                    "why": "", "jev": None}
+
+        verdict = verdicts.get("q0") or {}
+        value = verdict.get("value")
+        p = verdict.get("probability", 0.0)
+        fallback = verdict.get("fallback", "")
+        jev_rec = None
+        if record:
+            jev_rec = {
+                "judge": verdict.get("judge") or call_audit.get("judge"),
+                "latencyMs": verdict.get("latencyMs") or call_audit.get("latencyMs"),
+                "probability": p,
+                "value": value,
+                "fallback": fallback,
+            }
+
+        warn_thr = runtime.thresholds["warn"]
+        deny_thr = runtime.thresholds["deny"]
+        action = "no_owner"
+        owner: str | None = None
+        why = ""
+        if (not fallback) and value in live_ids and p >= warn_thr:
+            recheck, recheck_blockable = self._live_owner(value)
+            if recheck_blockable and recheck == value:
+                owner = value
+                why = f"jev 语义仲裁 {p:.2f}"
+                if p >= deny_thr and allow_deny and mode == "enforce":
+                    action = "deny"
+                else:
+                    action = "warn"
+        return {"ran": True, "action": action, "owner": owner, "why": why,
+                "jev": jev_rec}
 
     async def _guard_target(
         self,
@@ -1756,8 +1881,43 @@ class DispatchGuardMiddleware(MiddlewareBase):
         agent_id, why = self._route_hit(rel)
         owner, blockable = self._live_owner(agent_id)
         if not blockable:
+            arbitration = self._jev_blindspot(
+                rel, tool_name, mode=mode, allow_deny=allow_deny
+            )
+            jev_rec = arbitration["jev"]
+            if arbitration["ran"] and arbitration["action"] == "deny":
+                hint = arbitration["owner"]
+                yield self._deny(
+                    f"该产出属于 {hint} 域（命中 {arbitration['why']}），"
+                    f"请用 submit_to_agent 派发给 {hint}；"
+                    f"如确属编排/元操作，请与用户确认后加入白名单。目标：{rel}",
+                    tool_name,
+                    rel,
+                    mode,
+                    jev=jev_rec,
+                )
+                return
+            if arbitration["ran"] and arbitration["action"] == "warn":
+                hint = arbitration["owner"]
+                async for event in self._warn_and_pass(
+                    f"[dispatch-guard warn] {source} {rel} 命中 {hint}"
+                    f"（{arbitration['why']}）；enforce 模式下交付物写入将被拒绝，"
+                    f"请改用 submit_to_agent 派发。",
+                    tool_name,
+                    rel,
+                    mode,
+                    next_handler,
+                    jev=jev_rec,
+                ):
+                    yield event
+                return
             async for event in self._no_owner_pass(
-                f"no live owner for {rel}", tool_name, rel, mode, next_handler
+                f"no live owner for {rel}",
+                tool_name,
+                rel,
+                mode,
+                next_handler,
+                jev=jev_rec,
             ):
                 yield event
             return
@@ -1828,16 +1988,25 @@ class DispatchGuardMiddleware(MiddlewareBase):
                     return rule.get("agent"), f"kw {kw}"
         return None, None
 
-    def _deny(self, text: str, tool_name: str, target: str, mode: str) -> ToolResponse:
-        self._log(
-            {
-                "action": "denied",
-                "tool": tool_name,
-                "target": target,
-                "mode": mode,
-                "message": text,
-            }
-        )
+    def _deny(
+        self,
+        text: str,
+        tool_name: str,
+        target: str,
+        mode: str,
+        *,
+        jev: dict[str, Any] | None = None,
+    ) -> ToolResponse:
+        record: dict[str, Any] = {
+            "action": "denied",
+            "tool": tool_name,
+            "target": target,
+            "mode": mode,
+            "message": text,
+        }
+        if jev is not None:
+            record["jev"] = jev
+        self._log(record)
         return ToolResponse(
             content=[TextBlock(type="text", text=text)],
             state=ToolResultState.DENIED,
@@ -1851,16 +2020,19 @@ class DispatchGuardMiddleware(MiddlewareBase):
         mode: str,
         next_handler: Callable[..., AsyncGenerator[Any, None]],
         action: str = "warned",
+        *,
+        jev: dict[str, Any] | None = None,
     ) -> AsyncGenerator[Any, None]:
-        self._log(
-            {
-                "action": action,
-                "tool": tool_name,
-                "target": target,
-                "mode": mode,
-                "message": warn,
-            }
-        )
+        record: dict[str, Any] = {
+            "action": action,
+            "tool": tool_name,
+            "target": target,
+            "mode": mode,
+            "message": warn,
+        }
+        if jev is not None:
+            record["jev"] = jev
+        self._log(record)
         async for event in next_handler():
             if isinstance(event, ToolResponse):
                 event.content.append(TextBlock(type="text", text=warn))
