@@ -31,3 +31,4 @@ htmlcov/
 
 # Interception log, if you point the plugin at this checkout
 logs/
+JEV_P0_TODO.md

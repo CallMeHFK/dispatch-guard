@@ -269,6 +269,19 @@ table lives:
   "write_tools": [],         // extra write-capable tool names to guard (host tools
                              // that produce files, e.g. code runners, downloaders;
                              // paths inside their arguments are scanned too)
+  "jev": {                   // OPT-IN semantic arbitration layer (default off =
+                             // zero network, byte-identical behaviour; see below)
+    "enabled": false,
+    "judges": "inherit:jev-kernel",  // read endpoints/models from the jev-kernel
+                                     // plugin's jev.json (single source of truth),
+                                     // or an inline [{"name","type","baseUrl",
+                                     // "model","timeoutMs"}] list
+    "tiers": ["lux"],        // judge whitelist — lux only
+    "thresholds": "inherit", // or {"deny": 0.85, "warn": 0.6}
+    "online_timeout_ms": 2500,       // hard cap per judge call (min'ed with the
+                                     // judge spec's own timeoutMs)
+    "record": true           // write jev decisions into the audit trail
+  },
   "routes": [                // keyword -> owning agent (CJK substring, ASCII word-boundary)
     {"match": ["文档", "报告", "docx", "pdf"], "agent": "DocAgent"},
     {"match": ["代码", "refactor", "debug", "CI"], "agent": "CodeAgent"}
@@ -301,6 +314,29 @@ a cold start with nothing good ever loaded fails open to `off` (with an
 exception in the host log) — a table we cannot read must not become a
 blanket blocker, and a table we read *yesterday* still must not become a
 blanket pass-through.
+
+### jev: opt-in semantic arbitration (P0)
+
+With `jev.enabled: true`, the draft generator gains a semantic layer between
+the orchestrator's declared dispatch policy (which always wins, and is never
+charged judge latency) and the keyword scan: one judge call asks which live
+agent owns each deliverable category, and only **certain answers naming a
+live agent** count. An "unrouted" answer, sub-threshold confidence, a judge
+naming an agent that is not installed, or a dead/slow/garbled judge all fall
+back to the keyword scan — the scan is the fallback, never replaced, and the
+hook fails open on any internal error. Judge endpoints and models come from
+the jev-kernel plugin's own `jev.json` (`inherit:jev-kernel`; `$JEV_KERNEL_CONFIG`
+→ jev-kernel's plugin directory → its plugin-data copy, in that order), the
+`tiers` whitelist pins which of those judges may be dialed, and jev-kernel's
+global `enabled: false` is authoritative — a parked kernel disables this
+layer too. The wire dialect is a stdlib mirror of jev-kernel's raw
+`systemone` protocol, pinned by contract tests against a fake server.
+Decisions land in the audit trail under a `jev` subobject
+(`{judge, latencyMs, probability, value, fallback}`); set `record: false` to
+suppress that. Scope note: P0 covers draft generation only — online
+blind-spot arbitration (P1) and shell-mention escalation (P2) are designed
+in [docs/JEV_INTEGRATION.md](docs/JEV_INTEGRATION.md) and intentionally not
+implemented yet.
 
 ## Logging
 
@@ -419,7 +455,19 @@ asset.) Pushing a `v*` tag by hand still works as the manual path.
 
 ## Privacy
 
-No network calls, no telemetry. What the plugin writes on the local machine:
+No network calls, no telemetry — by default. The one opt-in exception is the
+`jev` arbitration layer: with `jev.enabled: true` the draft generator dials
+exactly the judge endpoints named by the resolved judge configuration —
+with `inherit:jev-kernel` that is your own jev-kernel `jev.json`, i.e. the
+local/LAN models you already run, and the `tiers` whitelist locks which of
+them may be contacted (`["lux"]` by default). Nothing is dialed while
+`enabled` is false (the test suite asserts zero outbound sockets in that
+state), and only agent manifests (ids, skills, descriptions) and the
+deliverable category list are ever sent — never file contents or command
+lines. Inline `judges` pointing at a cloud endpoint are possible by
+configuration; that choice and its disclosure are then yours.
+
+What the plugin writes on the local machine:
 interception records in `<workspace>/logs/dispatch_guard.jsonl` (tool targets
 and hint text — shell command lines are never stored verbatim, and free-form
 task text arrives only as a hash plus a credential-redacted excerpt; see the
