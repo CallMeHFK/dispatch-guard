@@ -15,8 +15,8 @@
 
 | tier | type | baseUrl | model | timeoutMs |
 |---|---|---|---|---|
-| lux | systemone | `http://100.100.231.22:8090` | `StartLux-Decision-2B-Q8_0` | 3000 |
-| clef | systemone | `http://192.168.1.132:11434`（Ollama ≥0.35 decision 模型） | `clef-flash:latest` | 30000 |
+| lux | systemone | `http://<judge-a>.internal:8090`（自托管，占位符） | `<decision-model-a>` | 3000 |
+| clef | systemone | `http://<judge-b>.internal:11434`（Ollama ≥0.35 decision 模型，占位符） | `<decision-model-b>` | 30000 |
 | session | llm（继承 QwenPaw 会话模型，OpenAI-compatible，`enable_thinking:false`） | ProviderManager 解析 | 会话 active_model | 15000 |
 
 wire 协议（jev-kernel `backend/judges.py`，参照 mu-agent 0.1.8 验证）：
@@ -32,8 +32,8 @@ wire 协议（jev-kernel `backend/judges.py`，参照 mu-agent 0.1.8 验证）�
 ### 1.1 实测（2026-10-13，本机直测）
 
 - **lux 存活**：`POST /v1/systemone` 200，**121ms**，应答 `{"answers":{"q0":{"type":"noul","noul":0.675}}}` —— raw 方言（noul 键）与协议假设逐字吻合；121ms ≪ 2500ms 硬帽，D3 预算余量充足（硬帽保留 2500 不降，给冷启动尖峰留余量）。
-- **clef 双地址皆死**：① 本机 Ollama = **v0.33.3 < 0.35**，无 `/v1/systemone` 端点 → 404（`clef-flash:latest` 模型已 pull 在服务端却serve不出协议）；② `192.168.1.132` 非本机（本机 LAN IP 为 192.168.1.2）且当前不可达（connect 失败）。hook 宿主配置 `~/.jev-kernel/jev.json` 的 clef 指向 127.0.0.1:11434，同样死。
-- **当前有效链 = lux → session**（clef 层按级联语义记 error 跳过，设计已覆盖，无需改代码）。运维复活 clef 二选一：本机 Ollam a 升级 ≥0.35（模型已就绪，升级即活），或恢复 192.168.1.132 可达。此为 jev-kernel 运维项，不阻塞 dispatch-guard 接入。
+- **clef 双地址皆死（实测时点）**：① 其中一址是本机旧版 Ollama（< 0.35，无 `/v1/systemone` 端点 → 404，模型已 pull 但服务端 serve 不出协议）；② 另一址为不可达的 LAN 主机（connect 失败）。hook 宿主配置里的 clef 指向本机回环地址，同样死。
+- **实测时点有效链 = lux → session**（clef 层按级联语义记 error 跳过，设计已覆盖，无需改代码）。运维复活 clef 二选一：本机 Ollama 升级 ≥0.35，或恢复该 LAN 主机可达。此为 jev-kernel 运维项，不阻塞 dispatch-guard 接入。
 - **.env 澄清**：全盘（磁盘 .env × 10、QwenPaw 宿主进程 env、hook 宿主目录）均无 jev/typesafe/ollama 相关键；「已部署模型」的信息实际住在两处 `jev.json`（plugin-data 与 ~/.jev-kernel），不在 .env。唯一相邻密钥是 wave-mcp 进程 env 的 OpenCode 键（与 jev-kernel 无关）；内置 `jev` tier 的 OpenCode Zen 免费回退本就不需要键。
 
 ## 2. 设计决策（D1–D6 沿用 v2，D7 新增）

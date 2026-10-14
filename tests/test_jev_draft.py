@@ -108,7 +108,7 @@ class JevDraftTest(unittest.TestCase):
         return {
             "type": "systemone",
             "baseUrl": url,
-            "model": "StartLux-Decision-2B-Q8_0",
+            "model": "judge-model",
             "timeoutMs": 3000,
         }
 

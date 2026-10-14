@@ -132,7 +132,7 @@ class JevBlindspotTest(unittest.TestCase):
     @staticmethod
     def _lux(url):
         return {"type": "systemone", "baseUrl": url,
-                "model": "StartLux-Decision-2B-Q8_0", "timeoutMs": 3000}
+                "model": "judge-model", "timeoutMs": 3000}
 
     @staticmethod
     def _jev_block(**over):
